@@ -1313,7 +1313,7 @@ class dotdict(dict):
             raise AttributeError(name)
 
 
-args = dotdict(all=True, max_depth=30, train_on=["xy", "z", "grade", "heatmap"])
+args = dotdict(all=True, max_depth=30, train_on=["zxy", "grade"])
 
 today_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 checkpoint_dir = f"checkpoints_{today_str}"
@@ -1451,3 +1451,4 @@ if TEST:
     with torch.no_grad():
         with torch.amp.autocast(device):
             output = model(batch_input)
+            print(output.keys())
