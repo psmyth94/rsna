@@ -26,6 +26,22 @@ logger = logging.getLogger(__name__)
 _default_handler = None
 
 
+def free_gpu_memory():
+    # Delete all tensors that are no longer needed
+    for obj in list(locals().values()):
+        if torch.is_tensor(obj) and obj.is_cuda:
+            del obj
+
+    # Release all unreferenced memory held by PyTorch's caching allocator
+    torch.cuda.empty_cache()
+
+    # Forcing PyTorch to free any memory that it can currently release
+    torch.cuda.ipc_collect()
+
+    # Optional: Synchronize to make sure all pending operations are done
+    torch.cuda.synchronize()
+
+
 class AverageMeter(object):
     """Computes and stores the average and current value"""
 
@@ -182,7 +198,7 @@ class Encoder2DUNet3D(nn.Module):
     def forward(self, batch):
         device = self.D.device
         image = batch["image"].to(device)
-        D = batch["D"]
+        D = batch["D"].cpu().tolist()
         num_image = len(D)
 
         B, H, W = image.shape
@@ -223,6 +239,7 @@ class Encoder2DUNet3D(nn.Module):
         if "zxy" in self.train_on and "grade" in self.train_on:
             xy, z = heatmap_to_coord(heatmap)
             grade = heatmap_to_grade(heatmap)
+            heatmap = torch.cat([all.permute(2, 0, 1, 3, 4) for all in heatmap])
         elif "grade" in self.train_on:
             num_point = xy.shape[1]
             grade = masks_to_grade(zxy_mask, grade_mask)
@@ -243,13 +260,13 @@ class Encoder2DUNet3D(nn.Module):
                         heatmap, batch["heatmap"].to(device), D
                     )
                 else:
-                    output["zxy_mask_loss"] = F_xyz_mask_loss(
-                        zxy_mask, batch["zxy_mask"].to(device), D
+                    output["heatmap_loss"] = F_xyz_mask_loss(
+                        zxy_mask, batch["heatmap"].to(device), D
                     )
 
-                output["zxy_loss"] = F_zxy_loss(
-                    z, xy, batch["z"].to(device), batch["xy"].to(device)
-                )
+                mask = batch["z"].to(device) != -1
+                output["z_loss"] = F_z_loss(z, batch["z"].to(device), mask)
+                output["xy_loss"] = F_xy_loss(xy, batch["xy"].to(device), mask)
 
             if "grade" in self.train_on:
                 index, valid = do_dynamic_match_truth(xy, batch["xy"].to(device))
@@ -395,10 +412,15 @@ def F_grade_loss(grade, truth):
     return loss
 
 
-def F_zxy_loss(z, xy, z_truth, xy_truth):
-    m = z_truth != -1
+def F_z_loss(z, z_truth, mask):
     z_truth = z_truth.float()
-    loss = F.mse_loss(z[m], z_truth[m]) + F.mse_loss(xy[m], xy_truth[m])
+    loss = F.mse_loss(z[mask], z_truth[mask])
+    return loss
+
+
+def F_xy_loss(xy, xy_truth, mask):
+    xy_truth = xy_truth.float()
+    loss = F.mse_loss(xy[mask], xy_truth[mask])
     return loss
 
 
@@ -410,9 +432,9 @@ def F_heatmap_loss(heatmap, truth, D):
     loss = 0
     for i in range(num_image):
         p, q = truth[i], heatmap[i]
-        D, num_point, num_grade, H, W = p.shape
+        D, _, _, _, _ = p.shape
 
-        eps = 1e-8
+        eps = 1e-6
         p = torch.clamp(p.transpose(1, 0).flatten(1), eps, 1 - eps)
         q = torch.clamp(q.transpose(1, 0).flatten(1), eps, 1 - eps)
         m = (0.5 * (p + q)).log()
@@ -435,8 +457,8 @@ def F_xyz_mask_loss(heatmap, truth, D):
     loss = 0
     for i in range(num_image):
         p, q = truth[i], heatmap[i]
-        D, num_point, H, W = p.shape
-        eps = 1e-8
+        D, _, _, _, _ = p.shape
+        eps = 1e-6
         p = torch.clamp(p.transpose(1, 0).flatten(1), eps, 1 - eps)
         q = torch.clamp(q.transpose(1, 0).flatten(1), eps, 1 - eps)
         m = (0.5 * (p + q)).log()
@@ -1270,6 +1292,37 @@ def pvtv2_encode(x, e):
     return encode
 
 
+def show_mask(mask, ax):
+    color = np.array([30 / 255, 144 / 255, 255 / 255, 0.6])
+    h, w = mask.shape[-2:]
+    mask = mask.astype(np.uint8)
+    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    ax.imshow(mask_image)
+
+
+def show_points(coords, labels, ax, marker_size=375):
+    pos_points = coords[labels == 1]
+    neg_points = coords[labels == 0]
+    ax.scatter(
+        pos_points[:, 0],
+        pos_points[:, 1],
+        color="green",
+        marker="*",
+        s=marker_size,
+        edgecolor="white",
+        linewidth=1.25,
+    )
+    ax.scatter(
+        neg_points[:, 0],
+        neg_points[:, 1],
+        color="red",
+        marker="*",
+        s=marker_size,
+        edgecolor="white",
+        linewidth=1.25,
+    )
+
+
 # %%
 
 logger = logging.getLogger()
@@ -1313,7 +1366,7 @@ class dotdict(dict):
             raise AttributeError(name)
 
 
-args = dotdict(all=True, max_depth=30, train_on=["zxy", "grade"])
+args = dotdict(all=False, max_depth=30, train_on=["zxy", "grade"])
 
 today_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 checkpoint_dir = f"checkpoints_{today_str}"
@@ -1402,7 +1455,6 @@ else:
     val_loader = None
 
 # %%
-
 logger.info("Creating model and optimizer...")
 model = Encoder2DUNet3D(
     model_size="medium",
@@ -1417,38 +1469,270 @@ state_dict = torch.load(
 
 print(model.load_state_dict(state_dict, strict=False))  # True
 model = model.to(torch_device)
+# zxy_detector = None
+# if "zxy" not in args.train_on:
+#     zxy_detector = model
+#     model = None
 
 # %%
-TEST = True
-if TEST:
-    data = train_dataset[0]
-    image = data["image"].to(torch_device, non_blocking=True)
-    D = data["D"].to(torch_device, non_blocking=True)
-    batch_input = {
-        "image": image,
-        "D": [D.cpu().tolist()],
+DEBUG = False
+log_frequency = 1
+optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+
+num_epochs = 10
+
+# Calculate the total number of steps for OneCycleLR considering gradient accumulation
+steps_per_epoch = len(train_loader) // accumulation_steps
+scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    optimizer,
+    max_lr=1e-3,
+    steps_per_epoch=steps_per_epoch,
+    epochs=num_epochs,
+    pct_start=0.3,
+    anneal_strategy="cos",
+    div_factor=25.0,
+    final_div_factor=10000.0,
+)
+
+# Initialize GradScaler for mixed-precision training
+scaler = torch.amp.GradScaler(device)
+
+logger.info("Starting training...")
+
+best_val_loss = float("inf")  # Initialize best validation loss
+
+for epoch in range(num_epochs):
+    if DEBUG:
+        model.eval()
+    else:
+        model.train()
+
+    losses = {
+        "loss": AverageMeter(),
+        "z_loss": AverageMeter(),
+        "xy_loss": AverageMeter(),
+        "grade_loss": AverageMeter(),
+        "heatmap_loss": AverageMeter(),
+        "val_loss": AverageMeter(),
+        "val_z_loss": AverageMeter(),
+        "val_xy_loss": AverageMeter(),
+        "val_grade_loss": AverageMeter(),
+        "val_heatmap_loss": AverageMeter(),
     }
 
-    if "zxy" in args.train_on:
-        if "grade" in args.train_on:
-            batch_input["heatmap"] = data["heatmap"].to(torch_device, non_blocking=True)
-        else:
-            batch_input["zxy_mask"] = data["heatmap"].to(
-                torch_device, non_blocking=True
-            )
-        z_target = data["z"].to(torch_device, non_blocking=True)
-        xy_target = data["xy"].to(torch_device, non_blocking=True)
+    optimizer.zero_grad()  # Reset gradients at the start of each epoch
 
-        batch_input.update({
-            "z": z_target.unsqueeze(0),
-            "xy": xy_target.unsqueeze(0),
-        })
+    for batch_idx, batch in enumerate(train_loader):
+        image = batch["image"].to(torch_device, non_blocking=True)
+        D = batch["D"].to(torch_device, non_blocking=True)
+        heatmap_target = batch["heatmap"].to(torch_device, non_blocking=True)
+        z_target = batch["z"].to(torch_device, non_blocking=True)
+        xy_target = batch["xy"].to(torch_device, non_blocking=True)
+        grade_target = batch["grade"].to(torch_device, non_blocking=True)
 
-    if "grade" in args.train_on:
-        grade_target = data["grade"].to(torch_device, non_blocking=True)
-        batch_input["grade"] = grade_target.unsqueeze(0)
+        batch_input = {
+            "image": image,
+            "D": D,
+            "heatmap": heatmap_target,
+            # "heatmap_mask": heatmap_mask,
+            "z": z_target,
+            "xy": xy_target,
+            # "coords_mask": coords_mask,
+            "grade": grade_target,
+            # "label_mask": label_mask,
+        }
 
-    with torch.no_grad():
+        def get_output(model, batch_input):
+            if DEBUG:
+                with torch.no_grad():
+                    return model(batch_input)
+            else:
+                return model(batch_input)
+
+        outputs = {}
         with torch.amp.autocast(device):
-            output = model(batch_input)
-            print(output.keys())
+            outputs = get_output(model, batch_input)
+            # heatmap_loss = outputs["heatmap_loss"]
+            loss = torch.tensor(0.0, device=torch_device)
+            if "z_loss" in outputs:
+                loss += outputs["z_loss"]
+                losses["z_loss"].update(outputs["z_loss"].item(), batch_size)
+            if "xy_loss" in outputs:
+                loss += outputs["xy_loss"]
+                losses["xy_loss"].update(outputs["xy_loss"].item(), batch_size)
+            if "grade_loss" in outputs:
+                loss += outputs["grade_loss"]
+                losses["grade_loss"].update(outputs["grade_loss"].item(), batch_size)
+            if "heatmap_loss" in outputs:
+                loss += outputs["heatmap_loss"]
+                losses["heatmap_loss"].update(
+                    outputs["heatmap_loss"].item(), batch_size
+                )
+            # Normalize loss by accumulation_steps
+            losses["loss"].update(loss.item(), batch_size)
+            loss = loss / accumulation_steps
+
+        if not DEBUG:
+            # Scale the loss and perform backward pass
+            scaler.scale(loss).backward()
+
+            # Perform optimizer step and scheduler step every accumulation_steps
+            if (batch_idx + 1) % accumulation_steps == 0:
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                # Step optimizer and scaler
+                scaler.step(optimizer)
+                scaler.update()
+
+                # Zero gradients
+                optimizer.zero_grad()
+
+                # Step scheduler
+                scheduler.step()
+
+        # Logging
+        if (batch_idx + 1) % (log_frequency * accumulation_steps) == 0 or (
+            batch_idx + 1
+        ) == len(train_loader):
+            current_lr = optimizer.param_groups[0]["lr"]
+            msg = (
+                f"Epoch [{epoch + 1}/{num_epochs}], Step [{batch_idx + 1}/{len(train_loader)}], "
+                f"LR: {current_lr:.6f}, "
+                f"Loss: {losses['loss'].avg:.4f}, "
+            )
+            for key in outputs.keys():
+                if key in losses:
+                    msg += f"{key.capitalize()}: {losses[key].avg:.4f}, "
+            logger.info(msg)
+            if DEBUG:
+                break
+
+    # End of epoch logging
+    epoch_loss = losses["loss"].avg
+    msg = (
+        f"Epoch [{epoch + 1}/{num_epochs}] completed. "
+        f"Average Loss: {epoch_loss:.4f}, "
+    )
+    for key in outputs.keys():
+        if key in losses:
+            msg += f"Average {key.capitalize()}: {losses[key].avg:.4f}, "
+
+    logger.info(msg)
+
+    if val_loader is not None:
+        # Validation loop
+        model.eval()
+        val_outputs = {}
+        with torch.cuda.amp.autocast():
+            with torch.no_grad():
+                for batch_idx, val_batch in enumerate(val_loader):
+                    image = val_batch["image"].to(torch_device)
+                    D = val_batch["D"].to(torch_device)
+                    heatmap_target = val_batch.get("heatmap", None)
+                    # heatmap_mask = val_batch.get("heatmap_mask", None)
+                    z_target = val_batch.get("z", None)
+                    xy_target = val_batch.get("xy", None)
+                    # coords_mask = val_batch.get("coords_mask", None)
+                    grade_target = val_batch["grade"].to(torch_device)
+                    # label_mask = val_batch["label_mask"].to(device)
+
+                    val_batch_input = {
+                        "image": image,
+                        "D": D,
+                        "heatmap": heatmap_target,
+                        # "heatmap_mask": heatmap_mask,
+                        "z": z_target,
+                        "xy": xy_target,
+                        # "coords_mask": coords_mask,
+                        "grade": grade_target,
+                        # "label_mask": label_mask,
+                    }
+
+                    val_outputs = model(val_batch_input)
+
+                    val_loss = torch.tensor(0.0, device=torch_device)
+                    if "z_loss" in val_outputs:
+                        val_loss += val_outputs["z_loss"]
+                        losses["val_z_loss"].update(
+                            val_outputs["z_loss"].item(), batch_size
+                        )
+                    if "xy_loss" in val_outputs:
+                        val_loss += val_outputs["xy_loss"]
+                        losses["val_xy_loss"].update(
+                            val_outputs["xy_loss"].item(), batch_size
+                        )
+                    if "grade_loss" in val_outputs:
+                        val_loss += val_outputs["grade_loss"]
+                        losses["val_grade_loss"].update(
+                            val_outputs["grade_loss"].item(), batch_size
+                        )
+                    if "heatmap_loss" in val_outputs:
+                        val_loss += val_outputs["heatmap_loss"]
+                        losses["val_heatmap_loss"].update(
+                            val_outputs["heatmap_loss"].item(), batch_size
+                        )
+                    losses["val_loss"].update(val_loss.item(), batch_size)
+
+                    # Validation logging
+                    if (batch_idx + 1) % (log_frequency * accumulation_steps) == 0 or (
+                        batch_idx + 1
+                    ) == len(val_loader):
+                        msg = (
+                            f"Validation: Epoch [{epoch + 1}/{num_epochs}], Step [{batch_idx + 1}/{len(val_loader)}], "
+                            f"Validation Loss: {losses['val_loss'].avg:.4f}, "
+                        )
+                        for key in val_outputs.keys():
+                            if key in losses:
+                                msg += f"Validation {key.capitalize()}: {losses[key].avg:.4f}, "
+
+                        logger.info(msg)
+                        if DEBUG:
+                            break
+
+        avg_val_loss = losses["val_loss"].avg
+        msg = f"Validation Loss: {avg_val_loss:.4f}, "
+        for key in val_outputs:
+            if key in losses:
+                msg += f"Validation {key.capitalize()}: {losses[key].avg:.4f}, "
+        logger.info(msg)
+    else:
+        avg_val_loss = epoch_loss
+
+    if not DEBUG:
+        checkpoint_path = os.path.join(
+            checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pth"
+        )
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),  # Save scaler state
+                "loss": avg_val_loss,
+            },
+            checkpoint_path,
+        )
+        logger.info(f"Checkpoint saved at {checkpoint_path}")
+
+    if not DEBUG:
+        # Save the best model based on validation loss
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_path = os.path.join(checkpoint_dir, "best_model.pth")
+            torch.save(model.state_dict(), best_model_path)
+            logger.info(
+                f"Saved new best model with validation loss {best_val_loss:.4f}"
+            )
+    if DEBUG:
+        break
+
+if not DEBUG:
+    # Save the final model at the end of training
+    final_model_path = os.path.join(checkpoint_dir, "final_model.pth")
+    torch.save(model.state_dict(), final_model_path)
+    logger.info(f"Final model saved at {final_model_path}")
+
+logger.info("Training finished.")
+# %%
