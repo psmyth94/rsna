@@ -5,7 +5,6 @@ import glob
 import inspect
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -13,7 +12,6 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import psutil
 import pydicom
 import timm
 import torch
@@ -168,9 +166,11 @@ class Encoder2DUNet3D(nn.Module):
             out_channel=decoder_dim,
         )
         self.n_stages = 4
-        if "zxy" in self.train_on:
+        if "zxy" in self.train_on and "grade" in self.train_on:
+            self.heatmap = nn.Conv3d(decoder_dim[-1], 30, kernel_size=1)
+        elif "zxy" in self.train_on:
             self.zxy_mask = nn.Conv3d(decoder_dim[-1], 10, kernel_size=1)
-        if "grade" in self.train_on:
+        elif "grade" in self.train_on:
             self.grade_mask = nn.Conv3d(decoder_dim[-1], 128, kernel_size=1)
             self.grade = nn.Sequential(
                 nn.Linear(128, 128),
@@ -199,38 +199,54 @@ class Encoder2DUNet3D(nn.Module):
 
         zxy_mask = []  # prob heatmap
         grade_mask = []
+        heatmap = []
         for i in range(num_image):
             e = [encode[s][i].transpose(1, 0).unsqueeze(0) for s in range(4)]
-            l, _ = self.decoder(feature=e[-1], skip=e[:-1][::-1])
-            if "grade" in self.train_on:
-                g = self.grade_mask(l).squeeze(0)
+            decoded, _ = self.decoder(feature=e[-1], skip=e[:-1][::-1])
+            if "zxy" in self.train_on and "grade" in self.train_on:
+                num_point, num_grade = 10, 3
+                all = self.heatmap(decoded).squeeze(0)
+                _, d, h, w = all.shape
+                all = all.reshape(num_point, num_grade, d, h, w)
+                all = all.flatten(1).softmax(-1).reshape(num_point, num_grade, d, h, w)
+                heatmap.append(all)
+            elif "grade" in self.train_on:
+                g = self.grade_mask(decoded).squeeze(0)
                 grade_mask.append(g)
 
-            if "zxy" in self.train_on:
-                zxy = self.zxy_mask(l).squeeze(0)
+            elif "zxy" in self.train_on:
+                zxy = self.zxy_mask(decoded).squeeze(0)
                 _, d, h, w = zxy.shape
                 zxy = zxy.flatten(1).softmax(-1).reshape(-1, d, h, w)
                 zxy_mask.append(zxy)
 
-        if "grade" in self.train_on:
+        if "zxy" in self.train_on and "grade" in self.train_on:
+            xy, z = heatmap_to_coord(heatmap)
+            grade = heatmap_to_grade(heatmap)
+        elif "grade" in self.train_on:
             num_point = xy.shape[1]
-            grade = heatmap_to_grade(zxy_mask, grade_mask)
+            grade = masks_to_grade(zxy_mask, grade_mask)
             # print('grade', grade.shape)
             grade = grade.reshape(num_image * num_point, -1)
             grade = self.grade(grade)
             grade = grade.reshape(num_image, num_point, 3)
-
-        if "zxy" in self.train_on:
-            xy, z = heatmap_to_coord(zxy_mask)
+        elif "zxy" in self.train_on:
+            xy, z = zxy_mask_to_coord(zxy_mask)
             # ---
             zxy_mask = torch.cat(zxy_mask, 1).transpose(1, 0)
 
         output = {}
         if "loss" in self.output_type:
             if "zxy" in self.train_on:
-                output["zxy_mask_loss"] = F_xyz_mask_loss(
-                    zxy_mask, batch["zxy_mask"].to(device), D
-                )
+                if "grade" in self.train_on:
+                    output["heatmap_loss"] = F_heatmap_loss(
+                        heatmap, batch["heatmap"].to(device), D
+                    )
+                else:
+                    output["zxy_mask_loss"] = F_xyz_mask_loss(
+                        zxy_mask, batch["zxy_mask"].to(device), D
+                    )
+
                 output["zxy_loss"] = F_zxy_loss(
                     z, xy, batch["z"].to(device), batch["xy"].to(device)
                 )
@@ -256,6 +272,48 @@ class Encoder2DUNet3D(nn.Module):
 
 
 def heatmap_to_coord(heatmap):
+    num_image = len(heatmap)
+    device = heatmap[0].device
+    num_point, num_grade, D, H, W = heatmap[0].shape
+    D = max([h.shape[2] for h in heatmap])
+
+    # create coordinates grid.
+    x = torch.linspace(0, W - 1, W, device=device)
+    y = torch.linspace(0, H - 1, H, device=device)
+    z = torch.linspace(0, D - 1, D, device=device)
+
+    point_xy = []
+    point_z = []
+    for i in range(num_image):
+        num_point, num_grade, D, H, W = heatmap[i].shape
+        pos_x = x.reshape(1, 1, 1, 1, W)
+        pos_y = y.reshape(1, 1, 1, H, 1)
+        pos_z = z[:D].reshape(1, 1, D, 1, 1)
+
+        py = torch.sum(pos_y * heatmap[i], dim=(1, 2, 3, 4))
+        px = torch.sum(pos_x * heatmap[i], dim=(1, 2, 3, 4))
+        pz = torch.sum(pos_z * heatmap[i], dim=(1, 2, 3, 4))
+
+        point_xy.append(torch.stack([px, py]).T)
+        point_z.append(pz)
+
+    xy = torch.stack(point_xy)
+    z = torch.stack(point_z)
+    return xy, z
+
+
+def heatmap_to_grade(heatmap):
+    num_image = len(heatmap)
+    grade = []
+    for i in range(num_image):
+        num_point, num_grade, D, H, W = heatmap[i].shape
+        g = torch.sum(heatmap[i], dim=(2, 3, 4))
+        grade.append(g)
+    grade = torch.stack(grade)
+    return grade
+
+
+def zxy_mask_to_coord(heatmap):
     num_image = len(heatmap)
     device = heatmap[0].device
     _, _, H, W = heatmap[0].shape
@@ -286,7 +344,7 @@ def heatmap_to_coord(heatmap):
     return xy, z
 
 
-def heatmap_to_grade(heatmap, grade_mask):
+def masks_to_grade(heatmap, grade_mask):
     num_image = len(heatmap)
     grade = []
     for i in range(num_image):
@@ -328,13 +386,11 @@ def do_dynamic_match_truth(xy, truth_xy, threshold=3):
 
 
 def F_grade_loss(grade, truth):
-    eps = 1e-5
     weight = torch.FloatTensor([1, 2, 4]).to(grade.device)
 
     t = truth.reshape(-1)
     g = grade.reshape(-1, 3)
 
-    # loss = F.nll_loss( torch.clamp(g, eps, 1-eps).log(), t,weight=weight, ignore_index=-1)
     loss = F.cross_entropy(g, t, weight=weight, ignore_index=-1)
     return loss
 
@@ -343,6 +399,29 @@ def F_zxy_loss(z, xy, z_truth, xy_truth):
     m = z_truth != -1
     z_truth = z_truth.float()
     loss = F.mse_loss(z[m], z_truth[m]) + F.mse_loss(xy[m], xy_truth[m])
+    return loss
+
+
+def F_heatmap_loss(heatmap, truth, D):
+    heatmap = torch.split_with_sizes(heatmap, D, 0)
+    truth = torch.split_with_sizes(truth, D, 0)
+    num_image = len(heatmap)
+
+    loss = 0
+    for i in range(num_image):
+        p, q = truth[i], heatmap[i]
+        D, num_point, num_grade, H, W = p.shape
+
+        eps = 1e-8
+        p = torch.clamp(p.transpose(1, 0).flatten(1), eps, 1 - eps)
+        q = torch.clamp(q.transpose(1, 0).flatten(1), eps, 1 - eps)
+        m = (0.5 * (p + q)).log()
+
+        def kl(x, t):
+            return F.kl_div(x, t, reduction="batchmean", log_target=True)
+
+        loss += 0.5 * (kl(m, p.log()) + kl(m, q.log()))
+    loss = loss / num_image
     return loss
 
 
@@ -357,13 +436,14 @@ def F_xyz_mask_loss(heatmap, truth, D):
     for i in range(num_image):
         p, q = truth[i], heatmap[i]
         D, num_point, H, W = p.shape
-        print(p.shape)
-        print(q.shape)
         eps = 1e-8
         p = torch.clamp(p.transpose(1, 0).flatten(1), eps, 1 - eps)
         q = torch.clamp(q.transpose(1, 0).flatten(1), eps, 1 - eps)
         m = (0.5 * (p + q)).log()
-        kl = lambda x, t: F.kl_div(x, t, reduction="batchmean", log_target=True)
+
+        def kl(x, t):
+            return F.kl_div(x, t, reduction="batchmean", log_target=True)
+
         loss += 0.5 * (kl(m, p.log()) + kl(m, q.log()))
         print(loss)
     loss = loss / num_image
@@ -1192,6 +1272,35 @@ def pvtv2_encode(x, e):
 
 # %%
 
+logger = logging.getLogger()
+
+
+def logger_setup():
+    global _default_handler
+    if _default_handler is not None:
+        return
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+
+    # Log to console
+    _default_handler = logging.StreamHandler()
+    _default_handler.setLevel(logging.INFO)
+    _default_handler.setFormatter(formatter)
+    logger.addHandler(_default_handler)
+
+    # Log to file
+    file_handler = logging.FileHandler("train.log")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+
+logger_setup()
+
+# %%
+
 
 class dotdict(dict):
     __setattr__ = dict.__setitem__
@@ -1220,13 +1329,13 @@ series_df = pd.read_csv(os.path.join(base_path, "train_series_descriptions.csv")
 label_df = pd.read_csv(os.path.join(base_path, "train.csv"))
 coords_df = pd.read_csv(os.path.join(base_path, "train_label_coordinates.csv"))
 
-logger.info("Splitting data into training and validation sets...")
 train_study_ids, val_study_ids = split_study_ids(series_df)
 
 batch_size = 1
 accumulation_steps = 4  # Gradient accumulation steps
 
 if not args.all:
+    logger.info("Splitting data into training and validation sets...")
     train_series = filter_by_study_ids(series_df, train_study_ids)
     val_series = filter_by_study_ids(series_df, val_study_ids)
 
@@ -1243,7 +1352,7 @@ if not args.all:
         coords=train_coords,
         series=train_series,
         transform=None,
-        train_on="zxy",
+        train_on=args.train_on,
         max_depth=50 if args.max_depth is None else args.max_depth,
     )
 
@@ -1253,7 +1362,7 @@ if not args.all:
         coords=val_coords,
         series=val_series,
         transform=None,
-        train_on="zxy",
+        train_on=args.train_on,
         max_depth=50 if args.max_depth is None else args.max_depth,
     )
 
@@ -1272,13 +1381,14 @@ if not args.all:
         collate_fn=custom_collate_fn,
     )
 else:
+    logger.info("Creating dataset and data loader...")
     train_dataset = LumbarSpineDataset(
         image_dir=os.path.join(base_path, "train_images"),
         label=label_df,
         coords=coords_df,
         series=series_df,
         transform=None,
-        train_on="zxy",
+        train_on=args.train_on,
         max_depth=50 if args.max_depth is None else args.max_depth,
     )
 
@@ -1290,3 +1400,54 @@ else:
         collate_fn=custom_collate_fn,
     )
     val_loader = None
+
+# %%
+
+logger.info("Creating model and optimizer...")
+model = Encoder2DUNet3D(
+    model_size="medium",
+    strategy=1,
+    train_on=args.train_on,
+)
+state_dict = torch.load(
+    "data/00034142.pth",
+    map_location=lambda storage, loc: storage,
+    weights_only=True,
+)["state_dict"]
+
+print(model.load_state_dict(state_dict, strict=False))  # True
+model = model.to(torch_device)
+
+# %%
+TEST = True
+if TEST:
+    data = train_dataset[0]
+    image = data["image"].to(torch_device, non_blocking=True)
+    D = data["D"].to(torch_device, non_blocking=True)
+    batch_input = {
+        "image": image,
+        "D": [D.cpu().tolist()],
+    }
+
+    if "zxy" in args.train_on:
+        if "grade" in args.train_on:
+            batch_input["heatmap"] = data["heatmap"].to(torch_device, non_blocking=True)
+        else:
+            batch_input["zxy_mask"] = data["heatmap"].to(
+                torch_device, non_blocking=True
+            )
+        z_target = data["z"].to(torch_device, non_blocking=True)
+        xy_target = data["xy"].to(torch_device, non_blocking=True)
+
+        batch_input.update({
+            "z": z_target.unsqueeze(0),
+            "xy": xy_target.unsqueeze(0),
+        })
+
+    if "grade" in args.train_on:
+        grade_target = data["grade"].to(torch_device, non_blocking=True)
+        batch_input["grade"] = grade_target.unsqueeze(0)
+
+    with torch.no_grad():
+        with torch.amp.autocast(device):
+            output = model(batch_input)
