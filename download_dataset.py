@@ -28,10 +28,8 @@ def main(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Download dataset")
-    parser.add_argument("--dataset", "-d", type=str, required=True, help="Dataset name")
-    parser.add_argument(
-        "--competition", "-c", type=str, required=True, help="Competition name"
-    )
+    parser.add_argument("--dataset", "-d", type=str, help="Dataset name")
+    parser.add_argument("--competition", "-c", type=str, help="Competition name")
     return parser.parse_args()
 
 
