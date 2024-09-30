@@ -8,12 +8,22 @@ def main(args):
     api = KaggleApi()
     api.authenticate()
 
-    # Download a dataset (replace with the dataset you want)
-    api.competition_download_files(name, path="data/", force=True, quiet=False)
-    # unzip the dataset
-
-    with zipfile.ZipFile(f"data/{name}.zip", "r") as zip_ref:
-        zip_ref.extractall("data/isic-2024-challenge")
+    name = args.dataset if args.dataset else args.competition
+    author = ""
+    if "/" in name:
+        author = name.split("/")[0]
+        name = name.split("/")[1]
+    if args.competition:
+        # Download a dataset (replace with the dataset you want)
+        api.competition_download_files(name, path="data/", force=True, quiet=False)
+        # Unzip the dataset
+        with zipfile.ZipFile(f"data/{name}.zip", "r") as zip_ref:
+            zip_ref.extractall(f"data/{name}")
+    else:
+        # Download a dataset (replace with the dataset you want)
+        api.dataset_download_files(
+            f"{author}/{name}", path="data/", force=True, quiet=False, unzip=True
+        )
 
 
 def parse_args():
