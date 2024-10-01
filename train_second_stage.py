@@ -1,12 +1,10 @@
 # %%
-import argparse
 import datetime
 import glob
-import inspect
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional, Set, Tuple, Union
+from typing import List, Optional, Set, Union
 
 import cv2
 import matplotlib.pyplot as plt
@@ -143,11 +141,9 @@ def encode(x, e):
     return encode
 
 
-class Encoder2DUNet3D(nn.Module):
+class FirstStageModel(nn.Module):
     def __init__(
         self,
-        model_size: str,
-        strategy: int,
         dynamic_matching: bool = False,
         train_on=["zxy", "grade"],
     ):
@@ -161,7 +157,6 @@ class Encoder2DUNet3D(nn.Module):
         self.train_on = train_on
         self.dynamic_matching = dynamic_matching
         arch = "pvt_v2_b4"
-        # strategy 1
         encoder_dim = {
             "pvt_v2_b2": [64, 128, 320, 512],
             "pvt_v2_b4": [64, 128, 320, 512],
@@ -294,8 +289,126 @@ class Encoder2DUNet3D(nn.Module):
                 output["z"] = z
             if "grade" in self.train_on:
                 output["grade"] = F.softmax(grade, -1)
+            output["image"] = x
 
         return output
+
+
+class SecondStageModel(nn.Module):
+    def __init__(
+        self,
+        zxy_predictor,
+        crop_size=32,
+        num_grades=3,
+        xy_max=80,
+        output_type=["loss", "infer"],
+        pretrained=True,
+    ):
+        super(SecondStageModel, self).__init__()
+        self.crop_size = crop_size
+        self.num_grades = num_grades
+        self.xy_max = xy_max
+        self.zxy_predictor = zxy_predictor
+        self.zxy_predictor.output_type = ["infer"]
+        self.output_type = output_type
+
+        # Freeze the weights of the first stage model
+        for param in self.zxy_predictor.parameters():
+            param.requires_grad = False
+
+        self.backbone = timm.create_model(
+            "efficientnet_b0", pretrained=pretrained, num_classes=0
+        )
+        in_features = self.backbone.num_features
+
+        # Add a classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(in_features, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(128, num_grades),
+        )
+
+    def forward(self, batch):
+        output = self.zxy_predictor(batch)
+        z_pred = output["z"]
+        xy_pred = output["xy"]
+        device = z_pred.device
+        images = output["image"].to(device)
+        D_list = batch["D"].cpu().tolist()
+
+        images = images[:, 0, :, :]
+        num_images = len(D_list)
+        D_cumsum = [0] + np.cumsum(D_list).tolist()
+        crops = []
+        for i in range(num_images):
+            image_start = int(D_cumsum[i])
+            image_end = int(D_cumsum[i + 1])
+            image = images[image_start:image_end]  # Shape: (D_i, H, W)
+            z_i = z_pred[i].round().long()  # Shape: (num_points,)
+            xy_i = xy_pred[i]  # Shape: (num_points, 2)
+            num_points = z_i.shape[0]
+            for p in range(num_points):
+                z_p = z_i[p]
+                x_p, y_p = xy_i[p]
+                crop = self.extract_crop(image, z_p, x_p, y_p)
+                crops.append(crop)
+        # Stack crops
+        crops = torch.stack(
+            crops
+        )  # Shape: (batch_size * num_points, 3, H_crop, W_crop)
+        # Pass through the backbone
+        features = self.backbone(crops)
+        # Pass through the classifier
+        logits = self.classifier(features)
+        # Reshape to (num_images, num_points, num_grades)
+        logits = logits.view(num_images, num_points, -1)
+        output = {}
+        if "loss" in self.output_type:
+            output["grade_loss"] = F_grade_loss(logits, batch["grade"].to(device))
+        if "infer" in self.output_type:
+            output["grade"] = F.softmax(logits, -1)
+        return output
+
+    def extract_crop(self, image, z, x, y):
+        # image: tensor of shape (D, H, W)
+        # z: scalar
+        # x, y: scalars
+        D, H, W = image.shape
+        z = int(round(z.item() - 1))
+        x = int(round(W * (x.item() / self.xy_max)))
+        y = int(round(H * (y.item() / self.xy_max)))
+        # Ensure coordinates are within bounds
+        z = max(0, min(z, D - 1))
+        x = max(0, min(x, W - 1))
+        y = max(0, min(y, H - 1))
+        # Get the slice at depth z
+        slice_img = image[z]  # Shape: (H, W)
+        slice_img = slice_img.unsqueeze(0).repeat(3, 1, 1)
+        # Define the crop boundaries
+        half_size = self.crop_size // 2
+        x_min = max(0, x - half_size)
+        x_max = min(W, x + half_size)
+        y_min = max(0, y - half_size)
+        y_max = min(H, y + half_size)
+        # Crop the image
+        crop = slice_img[:, y_min:y_max, x_min:x_max]
+        # Pad the crop if necessary to get the desired size
+        pad_left = max(0, half_size - x)
+        pad_right = max(0, (x + half_size) - W)
+        pad_top = max(0, half_size - y)
+        pad_bottom = max(0, (y + half_size) - H)
+        crop = F.pad(
+            crop, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0
+        )
+        # Resize crop to the expected input size of the backbone
+        crop = F.interpolate(
+            crop.unsqueeze(0),
+            size=(self.crop_size, self.crop_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+        return crop  # Shape: (3, H_crop, W_crop)
 
 
 def heatmap_to_coord(heatmap):
@@ -1470,7 +1583,7 @@ class dotdict(dict):
             raise AttributeError(name)
 
 
-args = dotdict(all=False, max_depth=30, train_on=["zxy", "grade"])
+args = dotdict(all=False, max_depth=50, train_on=["zxy", "grade"], stage=2)
 
 today_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 checkpoint_dir = f"checkpoints_{today_str}"
@@ -1560,23 +1673,18 @@ else:
 
 # %%
 logger.info("Creating model and optimizer...")
-model = Encoder2DUNet3D(
-    model_size="medium",
-    strategy=1,
-    train_on=args.train_on,
-)
+model = FirstStageModel(train_on=args.train_on)
 state_dict = torch.load(
-    "data/00034142.pth",
+    "data/best_model.pth",
     map_location=lambda storage, loc: storage,
     weights_only=True,
-)["state_dict"]
+)
 
 print(model.load_state_dict(state_dict, strict=False))  # True
 model = model.to(torch_device)
-# zxy_detector = None
-# if "zxy" not in args.train_on:
-#     zxy_detector = model
-#     model = None
+if args.stage == 2:
+    model = SecondStageModel(model)
+    model = model.to(torch_device)
 
 # %%
 DEBUG = False
