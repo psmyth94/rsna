@@ -7,6 +7,8 @@ import torch
 import torch.amp
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
+
 from src.model.model import (
     AverageMeter,
     FirstStageModel,
@@ -19,7 +21,6 @@ from src.model.model import (
     logger_setup,
     split_study_ids,
 )
-from torch.utils.data import DataLoader
 
 # %%
 
@@ -31,7 +32,7 @@ logger_setup()
 base_path = "data/rsna-2024-lumbar-spine-degenerative-classification"
 base_model_path = "models"
 
-args = dotdict(all=False, max_depth=50, train_on=["zxy", "grade"], stage=2)
+args = dotdict(all=False, max_depth=50, train_on=["zxy", "grade"], stage=1)
 
 today_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 checkpoint_dir = f"checkpoints_{today_str}"
@@ -49,8 +50,8 @@ coords_df = pd.read_csv(os.path.join(base_path, "train_label_coordinates.csv"))
 
 train_study_ids, val_study_ids = split_study_ids(series_df)
 
-batch_size = 16
-accumulation_steps = 4  # Gradient accumulation steps
+batch_size = 2
+accumulation_steps = 1  # Gradient accumulation steps
 
 if not args.all:
     logger.info("Splitting data into training and validation sets...")
@@ -121,7 +122,7 @@ else:
 
 # %%
 logger.info("Creating model and optimizer...")
-model = FirstStageModel(train_on=args.train_on)
+model = FirstStageModel(train_on=args.train_on, dynamic_matching=True)
 state_dict = torch.load(
     f"{base_model_path}/first_stage_best_model.pth",
     map_location=lambda storage, loc: storage,
@@ -131,21 +132,25 @@ state_dict = torch.load(
 print(model.load_state_dict(state_dict, strict=False))  # True
 model = model.to(torch_device)
 if args.stage == 2:
-    model = SecondStageModelV2(model, pretrained=True)
+    model = SecondStageModelV2(model, pretrained=True, backbone="efficientnet_b0")
     model = model.to(torch_device)
 
 # %%
 DEBUG = False
 log_frequency = 1
-optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+optimizer = optim.SGD(
+    model.parameters(),
+    lr=1e-2,
+    momentum=0.9,
+)
 
-num_epochs = 10
+num_epochs = 100
 
 # Calculate the total number of steps for OneCycleLR considering gradient accumulation
 steps_per_epoch = len(train_loader) // accumulation_steps
 scheduler = torch.optim.lr_scheduler.OneCycleLR(
     optimizer,
-    max_lr=1e-3,
+    max_lr=1e-1,
     steps_per_epoch=steps_per_epoch,
     epochs=num_epochs,
     pct_start=0.3,
@@ -160,6 +165,8 @@ scaler = torch.amp.GradScaler(device)
 logger.info("Starting training...")
 
 best_val_loss = float("inf")  # Initialize best validation loss
+
+max_norm = 1.0
 
 for epoch in range(num_epochs):
     if DEBUG:
@@ -194,12 +201,9 @@ for epoch in range(num_epochs):
             "image": image,
             "D": D,
             "heatmap": heatmap_target,
-            # "heatmap_mask": heatmap_mask,
             "z": z_target,
             "xy": xy_target,
-            # "coords_mask": coords_mask,
             "grade": grade_target,
-            # "label_mask": label_mask,
         }
 
         def get_output(model, batch_input):
@@ -239,8 +243,8 @@ for epoch in range(num_epochs):
             # Perform optimizer step and scheduler step every accumulation_steps
             if (batch_idx + 1) % accumulation_steps == 0:
                 # Gradient clipping
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                # scaler.unscale_(optimizer)
+                # nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
 
                 # Step optimizer and scaler
                 scaler.step(optimizer)
@@ -251,6 +255,8 @@ for epoch in range(num_epochs):
 
                 # Step scheduler
                 scheduler.step()
+                if hasattr(model, "_ascension_callback"):
+                    model._ascension_callback()
 
         # Logging
         if (batch_idx + 1) % (log_frequency * accumulation_steps) == 0 or (
@@ -285,29 +291,23 @@ for epoch in range(num_epochs):
         # Validation looptrain
         model.eval()
         val_outputs = {}
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast(device):
             with torch.no_grad():
                 for batch_idx, val_batch in enumerate(val_loader):
                     image = val_batch["image"].to(torch_device)
                     D = val_batch["D"].to(torch_device)
                     heatmap_target = val_batch.get("heatmap", None)
-                    # heatmap_mask = val_batch.get("heatmap_mask", None)
                     z_target = val_batch.get("z", None)
                     xy_target = val_batch.get("xy", None)
-                    # coords_mask = val_batch.get("coords_mask", None)
                     grade_target = val_batch["grade"].to(torch_device)
-                    # label_mask = val_batch["label_mask"].to(device)
 
                     val_batch_input = {
                         "image": image,
                         "D": D,
                         "heatmap": heatmap_target,
-                        # "heatmap_mask": heatmap_mask,
                         "z": z_target,
                         "xy": xy_target,
-                        # "coords_mask": coords_mask,
                         "grade": grade_target,
-                        # "label_mask": label_mask,
                     }
 
                     val_outputs = model(val_batch_input)

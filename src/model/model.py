@@ -199,6 +199,7 @@ class FirstStageModel(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(128, 3),
             )
+        self.xy_max = 80
 
     def forward(self, batch):
         device = self.D.device
@@ -270,8 +271,12 @@ class FirstStageModel(nn.Module):
                     )
 
                 mask = batch["z"].to(device) != -1
-                output["z_loss"] = F_z_loss(z, batch["z"].to(device), mask)
-                output["xy_loss"] = F_xy_loss(xy, batch["xy"].to(device), mask)
+                output["z_loss"] = F_z_loss(
+                    z, batch["z"].to(device), mask, batch["D"].to(device)
+                )
+                output["xy_loss"] = F_xy_loss(
+                    xy, batch["xy"].to(device), mask, self.xy_max
+                )
 
             if "grade" in self.train_on:
                 if self.dynamic_matching:
@@ -425,12 +430,12 @@ class SecondStageModelV2(nn.Module):
     def __init__(
         self,
         zxy_predictor,
-        crop_size=32,
+        crop_size=80,
         depth_size=6,
         num_grades=3,
         xy_max=80,
         output_type=["loss", "infer"],
-        backbone="efficientnet_lite0",
+        backbone="efficientnet_b0",
         pretrained=True,
         in_chans=1,
         cutpoint_margin=0.15,
@@ -470,16 +475,16 @@ class SecondStageModelV2(nn.Module):
             self.backbone.head.fc = nn.Identity()
 
         self.head = nn.Sequential(nn.Linear(head_in_dim, 1), LogisticCumulativeLink(3))
+        self.ascension_callback = AscensionCallback(margin=cutpoint_margin)
 
     def forward(self, batch):
         output = self.zxy_predictor(batch)
         z_pred = output["z"]
         xy_pred = output["xy"]
         device = z_pred.device
-        images = output["image"].to(device)
+        images = batch["image"].to(device)
         D_list = batch["D"].cpu().tolist()
 
-        images = images[:, 0, :, :]
         num_images = len(D_list)
         D_cumsum = [0] + np.cumsum(D_list).tolist()
         crops = []
@@ -505,9 +510,10 @@ class SecondStageModelV2(nn.Module):
         logits = self.head(features)
         # Reshape to (num_images, num_points, num_grades)
         logits = logits.view(num_images, num_points, -1)
+        grade_probs = F.softmax(logits, -1)
         output = {}
         if "loss" in self.output_type:
-            output["grade_loss"] = F_grade_loss(logits, batch["grade"].to(device))
+            output["grade_loss"] = F_grade_loss(grade_probs, batch["grade"].to(device))
         if "infer" in self.output_type:
             output["grade"] = F.softmax(logits, -1)
         return output
@@ -564,6 +570,9 @@ class SecondStageModelV2(nn.Module):
             align_corners=False,
         ).squeeze(0)  # Shape: (1, D, H, W)
         return crop  # Shape: (1, D, H, W)
+
+    def _ascension_callback(self):
+        self.ascension_callback.clip(self.head[-1])
 
 
 def heatmap_to_coord(heatmap):
@@ -691,15 +700,22 @@ def F_grade_loss(grade, truth):
     return loss
 
 
-def F_z_loss(z, z_truth, mask):
+def F_z_loss(z, z_truth, mask, z_max=None):
     z_truth = z_truth.float()
     assert torch.any(z_truth != -1)  # need at least one valid label
+    z_max = z_max.float().unsqueeze(1)
+    if z_max is not None:
+        z = z / z_max
+        z_truth = z_truth / z_max
     loss = F.mse_loss(z[mask], z_truth[mask])
     return loss
 
 
-def F_xy_loss(xy, xy_truth, mask):
+def F_xy_loss(xy, xy_truth, mask, xy_max=None):
     xy_truth = xy_truth.float()
+    if xy_max is not None:
+        xy = xy / xy_max
+        xy_truth = xy_truth / xy_max
     loss = F.mse_loss(xy[mask], xy_truth[mask])
     return loss
 
@@ -871,9 +887,8 @@ class LumbarSpineDataset(Dataset):
         return instance_numbers_needed
 
     def _get_all(self, idx, count=0) -> Union[dict, torch.Tensor]:
+        sample_info = self.samples[idx]
         try:
-            sample_info = self.samples[idx]
-
             instance_numbers_needed = self._get_instance_numbers_needed(sample_info)
 
             # Read the series and process the volume
@@ -967,6 +982,8 @@ class LumbarSpineDataset(Dataset):
             if "grade" in self.train_on and grade is not None:
                 out["grade"] = grade.long()
 
+            out["study_id"] = sample_info["study_id"]
+            out["series_description"] = sample_info["series_description"]
             return out
 
         except Exception as e:
@@ -1712,3 +1729,125 @@ def show_points(coords, labels, ax, marker_size=375):
         edgecolor="white",
         linewidth=1.25,
     )
+
+
+def visualize_predictions_and_crop(model, batch, output_dir="plots"):
+    """
+    Takes in an instance of SecondStageModelV2 and a batch of data.
+    Uses the zxy_predictor to get z, x, y predictions.
+    Plots the predicted x,y positions on the original image.
+    Extracts the crop for one of the predicted points and visualizes it.
+    """
+    # Ensure the model is in evaluation mode
+    model.eval()
+
+    # Get device
+    device = next(model.parameters()).device
+
+    # Use the zxy_predictor to get predictions
+    with torch.no_grad():
+        output = model.zxy_predictor(batch)
+        z_pred = output["z"]  # List of tensors, each tensor is (num_points,)
+        xy_pred = output["xy"]  # List of tensors, each tensor is (num_points, 2)
+        images = batch["image"].to(device)  # Shape: (sum D_i, H, W)
+        D_list = batch["D"]  # Tensor of depths per image
+
+    num_images = len(D_list)
+    D_cumsum = [0] + torch.cumsum(D_list, dim=0).tolist()
+
+    series_description = batch["series_description"]
+    # For each image in the batch
+    for i in range(num_images):
+        image_start = int(D_cumsum[i])
+        image_end = int(D_cumsum[i + 1])
+        image = images[image_start:image_end]  # Shape: (D_i, H, W)
+        z_i = z_pred[i].round().long()  # Shape: (num_points,)
+        xy_i = xy_pred[i]  # Shape: (num_points, 2)
+        num_points = z_i.shape[0]
+
+        W = image.shape[2]
+        H = image.shape[1]
+        # Plot the image slice with predicted points
+        # We'll plot the slice at the predicted z position of the first point
+        os.makedirs(output_dir, exist_ok=True)
+        if "sagittal" in series_description[i].lower():
+            for idx in range(2):
+                if idx == 0:
+                    z_slice = z_i[0].item()
+                else:
+                    z_slice = z_i[-1].item()
+                if z_slice < 0 or z_slice >= image.shape[0]:
+                    z_slice = (
+                        image.shape[0] // 2
+                    )  # Default to middle slice if out of bounds
+
+                image_slice = image[z_slice].cpu().numpy()  # Shape: (H, W)
+
+                plt.figure(figsize=(6, 6))
+                plt.imshow(image_slice, cmap="gray")
+
+                # Transform predicted x, y coordinates to image pixel coordinates
+                if idx == 0:
+                    x_coords = xy_i[:5, 0].cpu().numpy() * (W / model.xy_max)
+                    y_coords = xy_i[:5, 1].cpu().numpy() * (H / model.xy_max)
+                else:
+                    x_coords = xy_i[-5:, 0].cpu().numpy() * (W / model.xy_max)
+                    y_coords = xy_i[-5:, 1].cpu().numpy() * (H / model.xy_max)
+
+                plt.scatter(x_coords, y_coords, c="r", marker="x")
+                plt.title(f"Image {i}, Slice {z_slice}")
+                plt.axis("off")
+                # save the plot
+                plt.savefig(f"{output_dir}/image_{i}_slice_{z_slice}.png")
+                plt.close()
+        elif "axial" in series_description[i].lower():
+            for idx in range(num_points):
+                z_slice = z_i[idx].item()
+                if z_slice < 0 or z_slice >= image.shape[0]:
+                    z_slice = image.shape[0] // 2
+                x_coords = xy_i[idx, 0].cpu().numpy() * (W / model.xy_max)
+                y_coords = xy_i[idx, 1].cpu().numpy() * (H / model.xy_max)
+
+                plt.figure(figsize=(6, 6))
+                plt.imshow(image[z_slice].cpu().numpy(), cmap="gray")
+                plt.scatter(x_coords, y_coords, c="r", marker="x")
+                plt.title(f"Image {i}, Slice {z_slice}")
+                plt.axis("off")
+                # save the plot
+                plt.savefig(f"{output_dir}/image_{i}_slice_{z_slice}.png")
+                plt.close()
+
+        for idx in range(num_points):
+            z_p = z_i[idx]
+            x_p = xy_i[idx, 0]
+            y_p = xy_i[idx, 1]
+            crop = model.extract_crop_3d(image, z_p, x_p, y_p)
+
+            D, H, W = image.shape
+            z = int(round(z_p.item()))
+            # Ensure coordinates are within bounds
+            z = max(0, min(z_p, D - 1))
+            # Define the cro boundaries
+            half_depth_size = model.depth_size // 2
+            z_min = max(0, z - half_depth_size)
+            z_max = min(D, z + half_depth_size)
+            z_slices = list(range(z_min, z_max + 1))
+
+            # Visualize the crop
+            def visualize_crop(crop):
+                # crop: tensor of shape (1, D, H, W)
+                crop = crop.squeeze(0)  # Shape: (D, H, W)
+                D, H, W = crop.shape
+                half_depth_size = model.depth_size // 2
+
+                # Plot each slice
+                fig, axes = plt.subplots(1, D, figsize=(D * 2, 2))
+                for idx in range(D):
+                    slice_idx = z_slices[idx]
+                    axes[idx].imshow(crop[idx].cpu().numpy(), cmap="gray")
+                    axes[idx].axis("off")
+                    axes[idx].set_title(f"Slice {slice_idx}")
+                fig.savefig(f"{output_dir}/crop_image_{i}_slice_{z_p}.png")
+                plt.close()
+
+        visualize_crop(crop)
