@@ -1,7 +1,5 @@
-import copy
 import glob
 import logging
-import math
 import os
 from pathlib import Path
 from typing import List, Optional, Set, Union
@@ -9,7 +7,6 @@ from typing import List, Optional, Set, Union
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-import open3d as o3d
 import pandas as pd
 import pydicom
 import timm
