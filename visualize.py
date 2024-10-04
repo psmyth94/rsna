@@ -7,7 +7,7 @@ import torch
 import torch.amp
 import torch.nn as nn
 import torch.optim as optim
-from src.model.model import (
+from src.rsna.rsna import (
     AverageMeter,
     FirstStageModel,
     LumbarSpineDataset,

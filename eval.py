@@ -8,13 +8,13 @@ import torch
 import torch.amp
 from torch.utils.data import DataLoader
 
-from src.model.model import (
+from src.rsna.rsna import (
     FirstStageModel,
     LumbarSpineDataset,
     SecondStageModel,
     custom_collate_fn,
-    logger_setup,
     dotdict,
+    logger_setup,
 )
 
 logger = logging.getLogger()

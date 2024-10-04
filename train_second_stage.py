@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from src.model.model import (
+from src.rsna.rsna import (
     AverageMeter,
     FirstStageModel,
     LumbarSpineDataset,
@@ -123,13 +123,13 @@ else:
 # %%
 logger.info("Creating model and optimizer...")
 model = FirstStageModel(train_on=args.train_on, dynamic_matching=True)
-state_dict = torch.load(
-    f"{base_model_path}/first_stage_best_model.pth",
-    map_location=lambda storage, loc: storage,
-    weights_only=True,
-)
+# state_dict = torch.load(
+#     f"{base_model_path}/first_stage_best_model.pth",
+#     map_location=lambda storage, loc: storage,
+#     weights_only=True,
+# )
 
-print(model.load_state_dict(state_dict, strict=False))  # True
+# print(model.load_state_dict(state_dict, strict=False))  # True
 model = model.to(torch_device)
 if args.stage == 2:
     model = SecondStageModelV2(model, pretrained=True, backbone="efficientnet_b0")

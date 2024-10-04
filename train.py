@@ -20,7 +20,7 @@ import torch.optim as optim
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 
-from src.model.model import (
+from src.rsna.rsna import (
     FirstStageModel,
     LumbarSpineDataset,
     SecondStageModel,

@@ -1,9 +1,12 @@
+import copy
 import glob
 import logging
+import math
 import os
 from pathlib import Path
 from typing import List, Optional, Set, Union
 
+import open3d as o3d
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
@@ -779,6 +782,7 @@ class LumbarSpineDataset(Dataset):
         transform=None,
         max_depth=50,
         train_on=["zxy", "grade"],
+        voxel_grid=False,
     ):
         """
         Args:
@@ -811,6 +815,118 @@ class LumbarSpineDataset(Dataset):
         self.output_dim = output_dim
         self.valid_indices = set(range(len(self.samples)))
 
+    def read_study_as_pcd(
+        self,
+        files,
+        series_types_dict=None,
+        downsampling_factor=1,
+        img_size=(256, 256),
+    ):
+        pcd_overall = o3d.geometry.PointCloud()
+
+        for path in files:
+            dicom_slice = pydicom.dcmread(path)
+
+            series_id = os.path.basename(os.path.dirname(path))
+            study_id = os.path.basename(os.path.dirname(os.path.dirname(path)))
+            if series_types_dict is None or int(series_id) not in series_types_dict:
+                series_desc = dicom_slice.SeriesDescription
+            else:
+                series_desc = series_types_dict[int(series_id)]
+                series_desc = series_desc.split(" ")[-1]
+
+            x_orig, y_orig = dicom_slice.pixel_array.shape
+            img = np.expand_dims(
+                cv2.resize(
+                    dicom_slice.pixel_array, img_size, interpolation=cv2.INTER_AREA
+                ),
+                -1,
+            )
+            x, y, z = np.where(img)
+
+            downsampling_factor_iter = max(
+                downsampling_factor, int(math.ceil(len(x) / 6e6))
+            )
+
+            index_voxel = np.vstack((x, y, z))[:, ::downsampling_factor_iter]
+            grid_index_array = index_voxel.T
+            pcd = o3d.geometry.PointCloud(
+                o3d.utility.Vector3dVector(grid_index_array.astype(np.float64))
+            )
+
+            vals = np.expand_dims(img[x, y, z][::downsampling_factor_iter], -1)
+            if series_desc == "T1":
+                vals = np.pad(vals, ((0, 0), (0, 2)))
+            elif series_desc == "T2":
+                vals = np.pad(vals, ((0, 0), (1, 1)))
+            elif series_desc == "T2/STIR":
+                vals = np.pad(vals, ((0, 0), (2, 0)))
+            else:
+                raise ValueError(f"Unknown series desc: {series_desc}")
+
+            pcd.colors = o3d.utility.Vector3dVector(vals.astype(np.float64))
+
+            dX, dY = dicom_slice.PixelSpacing
+            dZ = dicom_slice.SliceThickness
+
+            X = np.array(list(dicom_slice.ImageOrientationPatient[:3]) + [0]) * dX
+            Y = np.array(list(dicom_slice.ImageOrientationPatient[3:]) + [0]) * dY
+
+            for z in range(int(dZ)):
+                pos = list(dicom_slice.ImagePositionPatient)
+                if series_desc == "T2":
+                    pos[-1] += z
+                else:
+                    pos[0] += z
+                S = np.array(pos + [1])
+
+                transform_matrix = np.array([X, Y, np.zeros(len(X)), S]).T
+                transform_matrix = transform_matrix @ np.matrix(
+                    [
+                        [0, y_orig / img_size[1], 0, 0],
+                        [x_orig / img_size[0], 0, 0, 0],
+                        [0, 0, 1, 0],
+                        [0, 0, 0, 1],
+                    ]
+                )
+
+                pcd_overall += copy.deepcopy(pcd).transform(transform_matrix)
+
+        return pcd_overall
+
+    def read_study_as_voxel_grid(
+        self,
+        files,
+        series_type_dict=None,
+        downsampling_factor=1,
+        img_size=(256, 256),
+    ):
+        pcd_overall = self.read_study_as_pcd(
+            files,
+            series_types_dict=series_type_dict,
+            downsampling_factor=downsampling_factor,
+            img_size=img_size,
+        )
+        box = pcd_overall.get_axis_aligned_bounding_box()
+
+        max_b = np.array(box.get_max_bound())
+        min_b = np.array(box.get_min_bound())
+
+        pts = (np.array(pcd_overall.points) - (min_b)) * (
+            (img_size[0] - 1, img_size[0] - 1, img_size[0] - 1) / (max_b - min_b)
+        )
+        coords = np.round(pts).astype(np.int32)
+        vals = np.array(pcd_overall.colors, dtype=np.float16)
+
+        grid = np.zeros((3, img_size[0], img_size[0], img_size[0]), dtype=np.float16)
+        indices = coords[:, 0], coords[:, 1], coords[:, 2]
+
+        np.maximum.at(grid[0], indices, vals[:, 0])
+        np.maximum.at(grid[1], indices, vals[:, 1])
+        np.maximum.at(grid[2], indices, vals[:, 2])
+
+        return grid
+
     def _prepare_samples(self):
         samples = []
 
@@ -829,12 +945,14 @@ class LumbarSpineDataset(Dataset):
                 continue  # Skip if no DICOM files found
 
             # Prepare sample entry
-            samples.append({
-                "study_id": study_id,
-                "series_id": series_id,
-                "series_description": series_description,
-                "image_dir": image_dir,
-            })
+            samples.append(
+                {
+                    "study_id": study_id,
+                    "series_id": series_id,
+                    "series_description": series_description,
+                    "image_dir": image_dir,
+                }
+            )
         return samples
 
     def __len__(self):
@@ -897,6 +1015,7 @@ class LumbarSpineDataset(Dataset):
                 sample_info["series_id"],
                 sample_info["series_description"],
                 instance_numbers_needed,
+                as_voxel_grid=self.voxel_grid,
             )
 
             # Handle any errors in reading the series
@@ -973,11 +1092,13 @@ class LumbarSpineDataset(Dataset):
             }
 
             if "zxy" in self.train_on:
-                out.update({
-                    "z": z.half(),
-                    "xy": xy.half(),
-                    "heatmap": heatmap,
-                })
+                out.update(
+                    {
+                        "z": z.half(),
+                        "xy": xy.half(),
+                        "heatmap": heatmap,
+                    }
+                )
 
             if "grade" in self.train_on and grade is not None:
                 out["grade"] = grade.long()
@@ -1034,6 +1155,7 @@ class LumbarSpineDataset(Dataset):
         series_id,
         series_description,
         instance_numbers_needed: Optional[Set[int]] = None,
+        as_voxel_grid = False,
     ):
         error_code = ""
 
@@ -1059,24 +1181,28 @@ class LumbarSpineDataset(Dataset):
         # Make DICOM header DataFrame
         dicom_df = []
         for i, d in zip(instance_numbers, dicoms):
-            dicom_df.append({
-                "study_id": study_id,
-                "series_id": series_id,
-                "series_description": series_description,
-                "instance_number": i,
-                "ImagePositionPatient": [float(v) for v in d.ImagePositionPatient],
-                "ImageOrientationPatient": [
-                    float(v) for v in d.ImageOrientationPatient
-                ],
-                "PixelSpacing": [float(v) for v in d.PixelSpacing],
-                "SpacingBetweenSlices": float(getattr(d, "SpacingBetweenSlices", 1.0)),
-                "SliceThickness": float(getattr(d, "SliceThickness", 1.0)),
-                "grouping": str([
-                    round(float(v), 3) for v in d.ImageOrientationPatient
-                ]),
-                "H": d.pixel_array.shape[0],
-                "W": d.pixel_array.shape[1],
-            })
+            dicom_df.append(
+                {
+                    "study_id": study_id,
+                    "series_id": series_id,
+                    "series_description": series_description,
+                    "instance_number": i,
+                    "ImagePositionPatient": [float(v) for v in d.ImagePositionPatient],
+                    "ImageOrientationPatient": [
+                        float(v) for v in d.ImageOrientationPatient
+                    ],
+                    "PixelSpacing": [float(v) for v in d.PixelSpacing],
+                    "SpacingBetweenSlices": float(
+                        getattr(d, "SpacingBetweenSlices", 1.0)
+                    ),
+                    "SliceThickness": float(getattr(d, "SliceThickness", 1.0)),
+                    "grouping": str(
+                        [round(float(v), 3) for v in d.ImageOrientationPatient]
+                    ),
+                    "H": d.pixel_array.shape[0],
+                    "W": d.pixel_array.shape[1],
+                }
+            )
         dicom_df = pd.DataFrame(dicom_df)
 
         # Handle multi-shape images
@@ -1114,10 +1240,12 @@ class LumbarSpineDataset(Dataset):
             volume = np.stack(volume)
             volume = self.normalise_to_8bit(volume)
 
-            data.append({
-                "df": df_group,
-                "volume": volume,
-            })
+            data.append(
+                {
+                    "df": df_group,
+                    "volume": volume,
+                }
+            )
 
             # Sort data by group
             if "sagittal" in series_description.lower():
