@@ -7,9 +7,7 @@ import torch
 import torch.amp
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-
-from src.model.model import (
+from src.rsna.rsna import (
     AverageMeter,
     FirstStageModel,
     LumbarSpineDataset,
@@ -22,6 +20,7 @@ from src.model.model import (
     split_study_ids,
     visualize_predictions_and_crop,
 )
+from torch.utils.data import DataLoader
 
 # %%
 
