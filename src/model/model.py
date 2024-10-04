@@ -155,6 +155,7 @@ class FirstStageModel(nn.Module):
     def __init__(
         self,
         dynamic_matching: bool = False,
+        pretrained: bool = True,
         train_on=["zxy", "grade"],
     ):
         super().__init__()
@@ -176,7 +177,7 @@ class FirstStageModel(nn.Module):
 
         self.encoder = timm.create_model(
             model_name=arch,
-            pretrained=False,
+            pretrained=pretrained,
             in_chans=3,
             num_classes=0,
             global_pool="",
@@ -248,6 +249,7 @@ class FirstStageModel(nn.Module):
             heatmap = torch.cat([all.permute(2, 0, 1, 3, 4) for all in heatmap])
         elif "grade" in self.train_on:
             num_point = xy.shape[1]
+            zxy_mask = batch["zxy_mask"].to(device)
             grade = masks_to_grade(zxy_mask, grade_mask)
             # print('grade', grade.shape)
             grade = grade.reshape(num_image * num_point, -1)
@@ -437,7 +439,7 @@ class SecondStageModelV2(nn.Module):
         output_type=["loss", "infer"],
         backbone="efficientnet_b0",
         pretrained=True,
-        in_chans=1,
+        in_chans=3,
         cutpoint_margin=0.15,
     ):
         super(SecondStageModelV2, self).__init__()
@@ -448,7 +450,7 @@ class SecondStageModelV2(nn.Module):
         self.zxy_predictor = zxy_predictor
         self.zxy_predictor.output_type = ["infer"]
         self.output_type = output_type
-
+        self.in_chans = in_chans
         # Freeze the weights of the first stage model
         for param in self.zxy_predictor.parameters():
             param.requires_grad = False
@@ -462,6 +464,7 @@ class SecondStageModelV2(nn.Module):
             in_chans=in_chans,
             global_pool="max",
         )
+
         if "efficientnet" in backbone:
             head_in_dim = self.backbone.classifier.in_features
             self.backbone.classifier = nn.Sequential(
@@ -533,6 +536,143 @@ class SecondStageModelV2(nn.Module):
         half_size = self.crop_size // 2
         half_depth_size = self.depth_size // 2
         z_min = max(0, z - half_depth_size)
+
+        z_max = min(D, z + half_depth_size)
+        y_min = max(0, y - half_size)
+        y_max = min(H, y + half_size)
+        x_min = max(0, x - half_size)
+        x_max = min(W, x + half_size)
+        # Crop the volume
+        crop = image[
+            z_min:z_max, y_min:y_max, x_min:x_max
+        ]  # Shape: (D_crop, H_crop, W_crop)
+        # Pad the crop if necessary to get the desired size
+        pad_z_left = max(0, half_depth_size - z)
+        pad_z_right = max(0, (z + half_depth_size) - D)
+        pad_y_left = max(0, half_size - y)
+        pad_y_right = max(0, (y + half_size) - H)
+        pad_x_left = max(0, half_size - x)
+        pad_x_right = max(0, (x + half_size) - W)
+        # Note: pad order is (pad_W_left, pad_W_right, pad_H_left, pad_H_right, pad_D_left, pad_D_right)
+
+        pad = (
+            pad_x_left,
+            pad_x_right,
+            pad_y_left,
+            pad_y_right,
+            pad_z_left,
+            pad_z_right,
+        )
+        crop = F.pad(crop, pad, mode="constant", value=0)
+        # Now crop shape should be (D_crop_padded, H_crop_padded, W_crop_padded)
+        # Add channel dimension
+        if self.in_chans == 1:
+            crop = crop.unsqueeze(0)
+        else:
+            crop = crop.unsqueeze(0).repeat(self.in_chans, 1, 1, 1)
+        # Resize crop to expected input size if necessary
+        crop = F.interpolate(
+            crop.unsqueeze(
+                0
+            ),  # Shape: (1, in_chans, D_crop_padded, H_crop_padded, W_crop_padded)
+            size=(self.depth_size, self.crop_size, self.crop_size),
+            mode="trilinear",
+            align_corners=False,
+        ).squeeze(0)  # Shape: (in_chans, D_crop_padded, H_crop_padded, W_crop_padded)
+        return crop
+
+    def _ascension_callback(self):
+        self.ascension_callback.clip(self.head[-1])
+
+
+class SecondStageModelV3(nn.Module):
+    def __init__(
+        self,
+        zxy_predictor,
+        crop_size=80,
+        depth_size=6,
+        num_grades=3,
+        xy_max=80,
+        output_type=["loss", "infer"],
+        pretrained=True,
+        in_chans=1,
+    ):
+        super(SecondStageModelV3, self).__init__()
+        self.crop_size = crop_size
+        self.depth_size = depth_size
+        self.num_grades = num_grades
+        self.xy_max = xy_max
+        self.zxy_predictor = zxy_predictor
+        self.zxy_predictor.output_type = ["infer"]
+        self.output_type = output_type
+        self.in_chans = in_chans
+        self.encoder_decoder = FirstStageModel(
+            dynamic_matching=True,
+            pretrained=pretrained,
+            train_on=["grade"],
+        )
+        # Freeze the weights of the first stage model
+        for param in self.zxy_predictor.parameters():
+            param.requires_grad = False
+
+    def forward(self, batch):
+        output = self.zxy_predictor(batch)
+        z_pred = output["z"]
+        xy_pred = output["xy"]
+        device = z_pred.device
+        images = batch["image"].to(device)
+        D_list = batch["D"].cpu().tolist()
+
+        num_images = len(D_list)
+        D_cumsum = [0] + np.cumsum(D_list).tolist()
+        crops = []
+        for i in range(num_images):
+            image_start = int(D_cumsum[i])
+            image_end = int(D_cumsum[i + 1])
+            image = images[image_start:image_end]  # Shape: (D_i, H, W)
+            z_i = z_pred[i].round().long()  # Shape: (num_points,)
+            xy_i = xy_pred[i]  # Shape: (num_points, 2)
+            num_points = z_i.shape[0]
+            for p in range(num_points):
+                z_p = z_i[p]
+                x_p, y_p = xy_i[p]
+                crop = self.extract_crop_3d(image, z_p, x_p, y_p)
+                crops.append(crop)
+        # Stack crops
+        crops = torch.stack(
+            crops
+        )  # Shape: (batch_size * num_points, in_chans, D_crop, H_crop, W_crop)
+        # Pass through the backbone
+        crops = crops[:, 0, :, :]
+        new_D = torch.tensor([self.depth_size] * num_images).to(device)
+        crops = crops.reshape(-1, crops.shape[2], crops.shape[3])
+        if "loss" in self.output_type:
+            new_batch = {
+                "image": crops,
+                "D": new_D,
+                "zxy_mask": output["zxy_mask"],
+                "grade": batch["grade"],
+            }
+        else:
+            new_batch = {"image": crops, "D": new_D, "zxy_mask": output["zxy_mask"]}
+
+        return self.encoder_decoder(new_batch)
+
+    def extract_crop_3d(self, image, z, x, y):
+        # image: tensor of shape (D, H, W)
+        # z, x, y: scalars
+        D, H, W = image.shape
+        z = int(round(z.item()))
+        x = int(round(W * (x.item() / self.xy_max)))
+        y = int(round(H * (y.item() / self.xy_max)))
+        # Ensure coordinates are within bounds
+        z = max(0, min(z, D - 1))
+        x = max(0, min(x, W - 1))
+        y = max(0, min(y, H - 1))
+        # Define the crop boundaries
+        half_size = self.crop_size // 2
+        half_depth_size = self.depth_size // 2
+        z_min = max(0, z - half_depth_size)
         z_max = min(D, z + half_depth_size)
         y_min = max(0, y - half_size)
         y_max = min(H, y + half_size)
@@ -561,18 +701,20 @@ class SecondStageModelV2(nn.Module):
         crop = F.pad(crop, pad, mode="constant", value=0)
         # Now crop shape should be (D_crop_padded, H_crop_padded, W_crop_padded)
         # Add channel dimension
-        crop = crop.unsqueeze(0)  # Shape: (1, D, H, W)
+        if self.in_chans == 1:
+            crop = crop.unsqueeze(0)
+        else:
+            crop = crop.unsqueeze(0).repeat(self.in_chans, 1, 1, 1)
         # Resize crop to expected input size if necessary
         crop = F.interpolate(
-            crop.unsqueeze(0),  # Shape: (1, 1, D, H, W)
+            crop.unsqueeze(
+                0
+            ),  # Shape: (1, in_chans, D_crop_padded, H_crop_padded, W_crop_padded)
             size=(self.depth_size, self.crop_size, self.crop_size),
             mode="trilinear",
             align_corners=False,
-        ).squeeze(0)  # Shape: (1, D, H, W)
-        return crop  # Shape: (1, D, H, W)
-
-    def _ascension_callback(self):
-        self.ascension_callback.clip(self.head[-1])
+        ).squeeze(0)  # Shape: (in_chans, D_crop_padded, H_crop_padded, W_crop_padded)
+        return crop
 
 
 def heatmap_to_coord(heatmap):
@@ -728,7 +870,7 @@ def F_heatmap_loss(heatmap, truth, D):
     loss = 0
     for i in range(num_image):
         p, q = truth[i], heatmap[i]
-        D, _, _, _, _ = p.shape
+        D, _, _, _, _ = p.shape  # D, num_point, num_grade, H, W
 
         eps = 1e-6
         p = torch.clamp(p.transpose(1, 0).flatten(1), eps, 1 - eps)
@@ -1310,6 +1452,100 @@ class LumbarSpineDataset(Dataset):
 
         return xy_tensor, z_tensor  # , mask_tensor
 
+    def generate_smoothed_heatmap(
+        self, z_tensor, xy_tensor, grades_tensor, image_shape
+    ):
+        num_point = xy_tensor.shape[0]
+        num_grade = 3  # Assuming grades are 0, 1, 2
+        D, H, W = image_shape
+
+        # Initialize heatmap with zeros
+        heatmap = torch.zeros((D, num_point, num_grade, H, W), dtype=torch.float32)
+
+        # Standard deviations for the Gaussian kernel
+        sigma_spatial = 1.0  # Spatial dimensions (x, y, z)
+        sigma_grade = 1.0  # Grade dimension
+        tmp_size_spatial = int(sigma_spatial * 3)
+        tmp_size_grade = int(sigma_grade * 3)
+
+        for idx in range(num_point):
+            x = xy_tensor[idx, 0]
+            y = xy_tensor[idx, 1]
+            z = z_tensor[idx]
+            grade = grades_tensor[idx]
+
+            if z == -1 or grade == -1:
+                continue  # Skip if z or grade is invalid
+
+            # Convert to float for precise calculations
+            x = x.item()
+            y = y.item()
+            z = z.item()
+            g = grade.item()
+
+            # Define the ranges for x, y, z, and grade
+            x_min = max(0, int(x - tmp_size_spatial))
+            x_max = min(W, int(x + tmp_size_spatial + 1))
+            y_min = max(0, int(y - tmp_size_spatial))
+            y_max = min(H, int(y + tmp_size_spatial + 1))
+            z_min = max(0, int(z - tmp_size_spatial))
+            z_max = min(D, int(z + tmp_size_spatial + 1))
+            g_min = max(0, int(g - tmp_size_grade))
+            g_max = min(num_grade, int(g + tmp_size_grade + 1))
+
+            # Create coordinate grids
+            grid_x = torch.arange(x_min, x_max, dtype=torch.float32)
+            grid_y = torch.arange(y_min, y_max, dtype=torch.float32)
+            grid_z = torch.arange(z_min, z_max, dtype=torch.float32)
+            grid_g = torch.arange(g_min, g_max, dtype=torch.float32)
+
+            # Create meshgrid for the Gaussian kernel
+            zz, yy, xx, gg = torch.meshgrid(
+                grid_z, grid_y, grid_x, grid_g, indexing="ij"
+            )
+
+            # Compute the Gaussian kernel
+            gaussian = torch.exp(
+                -(
+                    ((xx - x) ** 2 + (yy - y) ** 2 + (zz - z) ** 2)
+                    / (2 * sigma_spatial**2)
+                    + ((gg - g) ** 2) / (2 * sigma_grade**2)
+                )
+            )
+
+            # Convert indices to long tensors for indexing
+            x_indices = torch.arange(x_min, x_max, dtype=torch.long)
+            y_indices = torch.arange(y_min, y_max, dtype=torch.long)
+            z_indices = torch.arange(z_min, z_max, dtype=torch.long)
+            g_indices = torch.arange(g_min, g_max, dtype=torch.long)
+
+            # Ensure that the Gaussian and heatmap indices align
+            # Gaussian shape: [len(grid_z), len(grid_y), len(grid_x), len(grid_g)]
+            # Heatmap slice shape: [len(z_indices), len(y_indices), len(x_indices), len(g_indices)]
+
+            # Assign the Gaussian values to the heatmap using advanced indexing
+            heatmap[
+                z_indices[:, None, None, None],
+                idx,
+                g_indices[None, None, None, :],
+                y_indices[None, :, None, None],
+                x_indices[None, None, :, None],
+            ] = torch.maximum(
+                heatmap[
+                    z_indices[:, None, None, None],
+                    idx,
+                    g_indices[None, None, None, :],
+                    y_indices[None, :, None, None],
+                    x_indices[None, None, :, None],
+                ],
+                gaussian,
+            )
+
+        # Normalize the heatmap over spatial dimensions (D, H, W)
+        heatmap = heatmap / (heatmap.sum(dim=(0, 3, 4), keepdim=True) + 1e-8)
+
+        return heatmap
+
     def generate_heatmap(
         self,
         z_tensor,
@@ -1432,7 +1668,6 @@ class LumbarSpineDataset(Dataset):
         H, W = int(H * scale), int(W * scale)
 
         heatmap = torch.zeros((D, num_point, H, W), dtype=torch.float32)
-
         sigma = 1
         tmp_size = sigma * 3
 
@@ -1817,37 +2052,56 @@ def visualize_predictions_and_crop(model, batch, output_dir="plots"):
                 plt.savefig(f"{output_dir}/image_{i}_slice_{z_slice}.png")
                 plt.close()
 
-        for idx in range(num_points):
-            z_p = z_i[idx]
-            x_p = xy_i[idx, 0]
-            y_p = xy_i[idx, 1]
-            crop = model.extract_crop_3d(image, z_p, x_p, y_p)
+        CONDITIONS = {
+            "sagittal t2/stir": [
+                "spinal_canal_stenosis",
+                "spinal_canal_stenosis",
+            ],  # repeat twice to match other series
+            "axial t2": [
+                "left_subarticular_stenosis",
+                "right_subarticular_stenosis",
+            ],
+            "sagittal t1": [
+                "left_neural_foraminal_narrowing",
+                "right_neural_foraminal_narrowing",
+            ],
+        }
+        LEVELS = ["l1_l2", "l2_l3", "l3_l4", "l4_l5", "l5_s1"]
+        for idx1, cond in enumerate(CONDITIONS[series_description[i]]):
+            for idx2, level in enumerate(LEVELS):
+                idx = idx1 * len(LEVELS) + idx2
+                z_p = z_i[idx]
+                x_p = xy_i[idx, 0]
+                y_p = xy_i[idx, 1]
+                crop = model.extract_crop_3d(image, z_p, x_p, y_p)
 
-            D, H, W = image.shape
-            z = int(round(z_p.item()))
-            # Ensure coordinates are within bounds
-            z = max(0, min(z_p, D - 1))
-            # Define the cro boundaries
-            half_depth_size = model.depth_size // 2
-            z_min = max(0, z - half_depth_size)
-            z_max = min(D, z + half_depth_size)
-            z_slices = list(range(z_min, z_max + 1))
-
-            # Visualize the crop
-            def visualize_crop(crop):
-                # crop: tensor of shape (1, D, H, W)
-                crop = crop.squeeze(0)  # Shape: (D, H, W)
-                D, H, W = crop.shape
+                D, H, W = image.shape
+                z = int(round(z_p.item()))
+                # Ensure coordinates are within bounds
+                z = max(0, min(z_p, D - 1))
+                # Define the cro boundaries
                 half_depth_size = model.depth_size // 2
+                z_min = z - half_depth_size
+                z_max = z + half_depth_size
+                z_slices = list(range(z_min, z_max))
 
-                # Plot each slice
-                fig, axes = plt.subplots(1, D, figsize=(D * 2, 2))
-                for idx in range(D):
-                    slice_idx = z_slices[idx]
-                    axes[idx].imshow(crop[idx].cpu().numpy(), cmap="gray")
-                    axes[idx].axis("off")
-                    axes[idx].set_title(f"Slice {slice_idx}")
-                fig.savefig(f"{output_dir}/crop_image_{i}_slice_{z_p}.png")
-                plt.close()
+                # Visualize the crop
+                def visualize_crop(crop):
+                    # crop: tensor of shape (1, D, H, W)
+                    crop = crop[0, :, :, :]  # Shape: (D, H, W)
+                    D, H, W = crop.shape
 
-        visualize_crop(crop)
+                    # Plot each slice
+                    fig, axes = plt.subplots(1, D, figsize=(D * 2, 2))
+                    # create title
+                    title = f"Image {i}, {cond}, {level}"
+                    fig.suptitle(title)
+                    for idx in range(len(z_slices)):
+                        slice_idx = z_slices[idx]
+                        axes[idx].imshow(crop[idx].cpu().numpy(), cmap="gray")
+                        axes[idx].axis("off")
+                        axes[idx].set_title(f"Slice {slice_idx}")
+                    fig.savefig(f"{output_dir}/crop_image_{i}_{cond}_{level}.png")
+                    plt.close()
+
+                visualize_crop(crop)

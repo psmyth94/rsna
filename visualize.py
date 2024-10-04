@@ -7,6 +7,8 @@ import torch
 import torch.amp
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
+
 from src.model.model import (
     AverageMeter,
     FirstStageModel,
@@ -20,7 +22,6 @@ from src.model.model import (
     split_study_ids,
     visualize_predictions_and_crop,
 )
-from torch.utils.data import DataLoader
 
 # %%
 
@@ -130,7 +131,7 @@ state_dict = torch.load(
 print(model.load_state_dict(state_dict, strict=False))  # True
 model = model.to(torch_device)
 if args.stage == 2:
-    model = SecondStageModelV2(model, pretrained=True)
+    model = SecondStageModelV2(model, crop_size=64, depth_size=10, pretrained=True)
     model = model.to(torch_device)
 
 
@@ -177,4 +178,3 @@ for batch_idx, batch in enumerate(train_loader):
         logger.info(f"Remaining needed examples: {needed_examples}")
     if len(needed_examples) == 0:
         break
-# %%

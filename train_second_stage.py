@@ -13,6 +13,7 @@ from src.model.model import (
     AverageMeter,
     FirstStageModel,
     LumbarSpineDataset,
+    SecondStageModel,
     SecondStageModelV2,
     custom_collate_fn,
     dotdict,
@@ -50,8 +51,8 @@ coords_df = pd.read_csv(os.path.join(base_path, "train_label_coordinates.csv"))
 
 train_study_ids, val_study_ids = split_study_ids(series_df)
 
-batch_size = 2
-accumulation_steps = 1  # Gradient accumulation steps
+batch_size = 1
+accumulation_steps = 4  # Gradient accumulation steps
 
 if not args.all:
     logger.info("Splitting data into training and validation sets...")
@@ -122,7 +123,7 @@ else:
 
 # %%
 logger.info("Creating model and optimizer...")
-model = FirstStageModel(train_on=args.train_on, dynamic_matching=True)
+model = FirstStageModel(train_on=args.train_on, dynamic_matching=False, pretrained=True)
 state_dict = torch.load(
     f"{base_model_path}/first_stage_best_model.pth",
     map_location=lambda storage, loc: storage,
@@ -131,26 +132,27 @@ state_dict = torch.load(
 
 print(model.load_state_dict(state_dict, strict=False))  # True
 model = model.to(torch_device)
+# %%
 if args.stage == 2:
-    model = SecondStageModelV2(model, pretrained=True, backbone="efficientnet_b0")
+    model = SecondStageModelV2(model, pretrained=True, crop_size=64, depth_size=10)
     model = model.to(torch_device)
 
 # %%
 DEBUG = False
-log_frequency = 1
+log_frequency = 10
 optimizer = optim.SGD(
     model.parameters(),
-    lr=1e-2,
+    lr=1e-3,
     momentum=0.9,
 )
 
-num_epochs = 100
+num_epochs = 30
 
 # Calculate the total number of steps for OneCycleLR considering gradient accumulation
 steps_per_epoch = len(train_loader) // accumulation_steps
 scheduler = torch.optim.lr_scheduler.OneCycleLR(
     optimizer,
-    max_lr=1e-1,
+    max_lr=1e-2,
     steps_per_epoch=steps_per_epoch,
     epochs=num_epochs,
     pct_start=0.3,
@@ -254,7 +256,8 @@ for epoch in range(num_epochs):
                 optimizer.zero_grad()
 
                 # Step scheduler
-                scheduler.step()
+                if scheduler is not None:
+                    scheduler.step()
                 if hasattr(model, "_ascension_callback"):
                     model._ascension_callback()
 
