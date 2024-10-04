@@ -7,6 +7,8 @@ import torch
 import torch.amp
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
+
 from src.rsna.rsna import (
     AverageMeter,
     FirstStageModel,
@@ -20,7 +22,6 @@ from src.rsna.rsna import (
     logger_setup,
     split_study_ids,
 )
-from torch.utils.data import DataLoader
 
 # %%
 
@@ -35,7 +36,7 @@ base_model_path = "models"
 args = dotdict(all=False, max_depth=50, train_on=["zxy", "grade"], stage=1)
 
 today_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-checkpoint_dir = f"checkpoints_{today_str}"
+checkpoint_dir = f"checkpoints_sagittal_t1_left_{today_str}"
 os.makedirs(checkpoint_dir, exist_ok=True)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch_device = torch.device(device)
@@ -137,7 +138,7 @@ if args.stage == 2:
     model = model.to(torch_device)
 
 # %%
-DEBUG = True
+DEBUG = False
 log_frequency = 10 if not DEBUG else 1
 optimizer = optim.SGD(
     model.parameters(),
