@@ -7,6 +7,8 @@ import torch
 import torch.amp
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader
+
 from src.rsna.rsna import (
     AverageMeter,
     FirstStageModel,
@@ -17,10 +19,10 @@ from src.rsna.rsna import (
     filter_by_study_ids,
     logger,
     logger_setup,
+    save_combined_heatmap_as_png,
     split_study_ids,
     visualize_predictions_and_crop,
 )
-from torch.utils.data import DataLoader
 
 # %%
 
@@ -28,7 +30,7 @@ logger_setup()
 
 # %%
 
-base_path = "data/rsna-2024-lumbar-spine-degenerative-classification"
+base_path = "data"
 base_model_path = "models"
 
 args = dotdict(all=False, max_depth=50, train_on=["zxy", "grade"], stage=2)
@@ -143,29 +145,22 @@ def get_output(model, batch_input, debug=False):
 
 
 # %%
-needed_examples = ["sagittal t2", "sagittal t1", "axial"]
+needed_examples = ["sagittal t1"]
 for batch_idx, batch in enumerate(train_loader):
-    image = batch["image"].to(torch_device, non_blocking=True)
-    D = batch["D"].to(torch_device, non_blocking=True)
-    heatmap_target = batch["heatmap"].to(torch_device, non_blocking=True)
-    z_target = batch["z"].to(torch_device, non_blocking=True)
-    xy_target = batch["xy"].to(torch_device, non_blocking=True)
-    grade_target = batch["grade"].to(torch_device, non_blocking=True)
-
     batch_input = {
-        "image": image,
-        "D": D,
-        "heatmap": heatmap_target,
-        "z": z_target,
-        "xy": xy_target,
-        "grade": grade_target,
-        "study_id": batch["study_id"],
-        "series_description": batch["series_description"],
+        k: v.to(torch_device) if isinstance(v, torch.Tensor) else v
+        for k, v in batch.items()
     }
-    visualize_predictions_and_crop(
-        model,
-        batch_input,
-        output_dir=f"/mnt/d/plots/{batch['study_id'][0]}/{batch['series_description'][0]}",
+    if batch_input["series_description"][0].lower() not in needed_examples:
+        continue
+
+    output = get_output(model, batch_input, debug=True)
+    save_combined_heatmap_as_png(
+        output["heatmap"].cpu().numpy(),
+        batch_input["grade"].cpu().numpy(),
+        batch_input["xy"].cpu().numpy(),
+        batch_input["z"].cpu().numpy(),
+        batch_input["image"].cpu().numpy(),
     )
     if any([x in batch["series_description"][0].lower() for x in needed_examples]):
         # remove from needed examples
