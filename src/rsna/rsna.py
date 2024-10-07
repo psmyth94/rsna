@@ -1,6 +1,7 @@
 import glob
 import logging
 import os
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Optional, Set, Union
 
@@ -18,6 +19,13 @@ import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 from spacecutter.callbacks import AscensionCallback, LogisticCumulativeLink
 from torch.utils.data import Dataset
+
+from .study_level_rsna import (
+    ResNeXt2D,
+    ResNeXt3D,
+    ResNeXtBottleneck2D,
+    ResNeXtBottleneck3D,
+)
 
 logger = logging.getLogger(__name__)
 _default_handler = None
@@ -196,8 +204,9 @@ class FirstStageModel(nn.Module):
         self.num_points = num_points
         self.num_grades = num_grades
         if "zxy" in self.train_on and "grade" in self.train_on:
-            self.heatmap = nn.Conv3d(
-                decoder_dim[-1], num_points * num_grades, kernel_size=1
+            self.heatmap = nn.Sequential(
+                nn.Dropout3d(0.5),
+                nn.Conv3d(decoder_dim[-1], num_points * num_grades, kernel_size=1),
             )
         elif "zxy" in self.train_on:
             self.zxy_mask = nn.Conv3d(decoder_dim[-1], num_points, kernel_size=1)
@@ -207,7 +216,8 @@ class FirstStageModel(nn.Module):
                 nn.Linear(128, 128),
                 nn.BatchNorm1d(128),
                 nn.ReLU(inplace=True),
-                nn.Linear(128, 3),
+                nn.Linear(128, 1),
+                nn.LogisticCumulativeLink(3),
             )
         self.xy_max = 80
 
@@ -231,6 +241,7 @@ class FirstStageModel(nn.Module):
 
         zxy_mask = []  # prob heatmap
         grade_mask = []
+        heatmap = []
         heatmap = []
         for i in range(num_image):
             e = [encode[s][i].transpose(1, 0).unsqueeze(0) for s in range(4)]
@@ -607,7 +618,8 @@ class SecondStageModelV3(nn.Module):
         xy_max=80,
         output_type=["loss", "infer"],
         pretrained=True,
-        in_chans=1,
+        in_chans=3,
+        cutpoint_margin=0.15,
     ):
         super(SecondStageModelV3, self).__init__()
         self.crop_size = crop_size
@@ -618,59 +630,256 @@ class SecondStageModelV3(nn.Module):
         self.zxy_predictor.output_type = ["infer"]
         self.output_type = output_type
         self.in_chans = in_chans
-        self.encoder_decoder = FirstStageModel(
-            dynamic_matching=True,
-            pretrained=pretrained,
-            train_on=["grade"],
-        )
         # Freeze the weights of the first stage model
         for param in self.zxy_predictor.parameters():
             param.requires_grad = False
 
+        # Axial branch (2D ResNeXt)
+        self.axial_branch = ResNeXt2D(
+            ResNeXtBottleneck2D, [3, 4, 6, 3], input_channels=8
+        )
+
+        # Sagittal branch (3D ResNeXt)
+        self.sagittal_t1_branch = ResNeXt3D(
+            ResNeXtBottleneck3D, [3, 4, 6, 3], input_channels=1
+        )
+
+        self.sagittal_t2_stir_branch = ResNeXt3D(
+            ResNeXtBottleneck3D, [3, 4, 6, 3], input_channels=1
+        )
+
+        # Combined features dimension
+        self.combined_features_dim = (
+            512 * ResNeXtBottleneck2D.expansion
+            + 512 * ResNeXtBottleneck3D.expansion
+            + 512 * ResNeXtBottleneck3D.expansion
+        )
+
+        # Classifier
+        # Fully connected layers for each task
+        self.fc_scs = nn.Linear(
+            self.combined_features_dim, num_grades
+        )  # Spinal canal stenosis
+        self.fc_rss = nn.Linear(
+            self.combined_features_dim, num_grades
+        )  # Right subarticular stenosis
+        self.fc_lss = nn.Linear(
+            self.combined_features_dim, num_grades
+        )  # Left subarticular stenosis
+        self.fc_rfn = nn.Linear(
+            self.combined_features_dim, num_grades
+        )  # Right foraminal narrowing
+        self.fc_lfn = nn.Linear(
+            self.combined_features_dim, num_grades
+        )  # Left foraminal narrowing
+
     def forward(self, batch):
-        output = self.zxy_predictor(batch)
-        z_pred = output["z"]
-        xy_pred = output["xy"]
-        device = z_pred.device
-        images = batch["image"].to(device)
-        D_list = batch["D"].cpu().tolist()
+        input_batch = {
+            "image": batch["image_sagittal_t1"],
+            "D": batch["D_sagittal_t1"],
+            "series_description": batch["series_description_sagittal_t1"],
+            "study_id": batch["study_id_sagittal_t1"],
+        }
+        output = self.zxy_predictor(input_batch)
+        z_pred_sagittal_t1 = output["z"]
+        xy_pred_sagittal_t1 = output["xy"]
+        images_sagittal_t1 = batch["image_sagittal_t1"]
+        D_list_sagittal_t1 = batch["D_sagittal_t1"].cpu().tolist()
 
-        num_images = len(D_list)
-        D_cumsum = [0] + np.cumsum(D_list).tolist()
-        crops = []
+        input_batch = {
+            "image": batch["image_sagittal_t2_stir"],
+            "D": batch["D_sagittal_t2_stir"],
+            "series_description": batch["series_description_sagittal_t2_stir"],
+            "study_id": batch["study_id_sagittal_t2_stir"],
+        }
+        output = self.zxy_predictor(input_batch)
+        z_pred_sagittal_t2_stir = output["z"]
+        xy_pred_sagittal_t2_stir = output["xy"]
+        images_sagittal_t2_stir = batch["image_sagittal_t2_stir"]
+        D_list_sagittal_t2_stir = batch["D_sagittal_t2_stir"].cpu().tolist()
+
+        input_batch = {
+            "image": batch["image_axial_t2"],
+            "D": batch["D_axial_t2"],
+            "series_description": batch["series_description_axial_t2"],
+            "study_id": batch["study_id_axial_t2"],
+        }
+        output = self.zxy_predictor(input_batch)
+        z_pred_axial = output["z"]
+        xy_pred_axial = output["xy"]
+        images_axial = batch["image_axial_t2"]
+        D_list_axial = batch["D_axial_t2"].cpu().tolist()
+
+        num_images = len(D_list_sagittal_t1)
+        D_cumsum_sagittal_t1 = [0] + np.cumsum(D_list_sagittal_t1).tolist()
+        D_cumsum_sagittal_t2_stir = [0] + np.cumsum(D_list_sagittal_t2_stir).tolist()
+        D_cumsum_axial = [0] + np.cumsum(D_list_axial).tolist()
+
+        device = z_pred_sagittal_t1.device
+
+        images_sagittal_t1 = images_sagittal_t1.to(device)
+        images_sagittal_t2_stir = images_sagittal_t2_stir.to(device)
+        images_axial = images_axial.to(device)
+
+        scs_tensors = []
+        rss_tensors = []
+        lss_tensors = []
+        rfn_tensors = []
+        lfn_tensors = []
         for i in range(num_images):
-            image_start = int(D_cumsum[i])
-            image_end = int(D_cumsum[i + 1])
-            image = images[image_start:image_end]  # Shape: (D_i, H, W)
-            z_i = z_pred[i].round().long()  # Shape: (num_points,)
-            xy_i = xy_pred[i]  # Shape: (num_points, 2)
-            num_points = z_i.shape[0]
-            for p in range(num_points):
-                z_p = z_i[p]
-                x_p, y_p = xy_i[p]
-                crop = self.extract_crop_3d(image, z_p, x_p, y_p)
-                crops.append(crop)
-        # Stack crops
-        crops = torch.stack(
-            crops
-        )  # Shape: (batch_size * num_points, in_chans, D_crop, H_crop, W_crop)
-        # Pass through the backbone
-        crops = crops[:, 0, :, :]
-        new_D = torch.tensor([self.depth_size] * num_images).to(device)
-        crops = crops.reshape(-1, crops.shape[2], crops.shape[3])
+            image_start_sagittal_t1 = int(D_cumsum_sagittal_t1[i])
+            image_end_sagittal_t1 = int(D_cumsum_sagittal_t1[i + 1])
+            image_sagittal_t1 = images_sagittal_t1[
+                image_start_sagittal_t1:image_end_sagittal_t1
+            ]  # Shape: (D_i, H, W)
+            z_i_sagittal_t1 = z_pred_sagittal_t1[i]  # Shape: (num_points,)
+            xy_i_sagittal_t1 = xy_pred_sagittal_t1[i]  # Shape: (num_points, 2)
+            z_i_sagittal_t1_center = z_i_sagittal_t1.mean().round().long()
+
+            image_start_sagittal_t2_stir = int(D_cumsum_sagittal_t2_stir[i])
+            image_end_sagittal_t2_stir = int(D_cumsum_sagittal_t2_stir[i + 1])
+            image_sagittal_t2_stir = images_sagittal_t2_stir[
+                image_start_sagittal_t2_stir:image_end_sagittal_t2_stir
+            ]
+            z_i_sagittal_t2_stir = z_pred_sagittal_t2_stir[i]
+            xy_i_sagittal_t2_stir = xy_pred_sagittal_t2_stir[i]
+            z_i_sagittal_t2_stir_center = z_i_sagittal_t2_stir.mean().round().long()
+
+            image_start_axial = int(D_cumsum_axial[i])
+            image_end_axial = int(D_cumsum_axial[i + 1])
+            image_axial = images_axial[image_start_axial:image_end_axial]
+            z_i_axial = z_pred_axial[i]
+            xy_i_axial = xy_pred_axial[i]
+
+            num_points = z_i_sagittal_t1.shape[0]
+            scs_list = []
+            rss_list = []
+            lss_list = []
+            rfn_list = []
+            lfn_list = []
+            for p in range(5):
+                # use all depths for sagittal t1 and sagittal t2 stir
+                p1 = p
+                p2 = p + 5
+                x_p1_sagittal_t1, y_p1_sagittal_t1 = xy_i_sagittal_t1[p1]
+                x_p2_sagittal_t1, y_p2_sagittal_t1 = xy_i_sagittal_t1[p2]
+                x_p_sagittal_t1 = (x_p1_sagittal_t1 + x_p2_sagittal_t1) / 2
+                y_p_sagittal_t1 = (y_p1_sagittal_t1 + y_p2_sagittal_t1) / 2
+                full_depth = D_list_sagittal_t1[i]
+                crop_sagittal_t1 = self.extract_crop_3d(
+                    image_sagittal_t1,
+                    z_i_sagittal_t1_center,
+                    x_p_sagittal_t1,
+                    y_p_sagittal_t1,
+                    depth_size=full_depth,
+                    crop_size=self.crop_size,
+                    in_chans=self.in_chans,
+                    full_depth=True,
+                ).unsqueeze(0)
+
+                x_p_sagittal_t2_stir, y_p_sagittal_t2_stir = xy_i_sagittal_t2_stir[p]
+                full_depth = D_list_sagittal_t2_stir[i]
+                crop_sagittal_t2_stir = self.extract_crop_3d(
+                    image_sagittal_t2_stir,
+                    z_i_sagittal_t2_stir_center,
+                    x_p_sagittal_t2_stir,
+                    y_p_sagittal_t2_stir,
+                    depth_size=full_depth,
+                    crop_size=self.crop_size,
+                    in_chans=self.in_chans,
+                    full_depth=True,
+                ).unsqueeze(0)
+
+                # we use size 8 for axial
+                x_p1_axial, y_p1_axial = xy_i_axial[p1]
+                x_p2_axial, y_p2_axial = xy_i_axial[p2]
+                x_p_axial = (x_p1_axial + x_p2_axial) / 2
+                y_p_axial = (y_p1_axial + y_p2_axial) / 2
+
+                z_p1_axial = z_i_axial[p1]
+                z_p2_axial = z_i_axial[p2]
+                z_p_axial = (z_p1_axial + z_p2_axial) / 2
+
+                full_depth = D_list_axial[i]
+                crop_axial = self.extract_crop_3d(
+                    image_axial, z_p_axial, x_p_axial, y_p_axial, 8, self.crop_size, 1
+                )
+
+                features_sagittal_t1 = self.sagittal_t1_branch(crop_sagittal_t1)
+                features_sagittal_t2_stir = self.sagittal_t2_stir_branch(
+                    crop_sagittal_t2_stir
+                )
+                features_axial = self.axial_branch(crop_axial)
+
+                # concatenate features
+                features = torch.cat(
+                    [features_sagittal_t1, features_sagittal_t2_stir, features_axial],
+                    dim=1,
+                )
+
+                # pass through the classifiers
+                scs = self.fc_scs(features).squeeze(0)
+                rss = self.fc_rss(features).squeeze(0)
+                lss = self.fc_lss(features).squeeze(0)
+                rfn = self.fc_rfn(features).squeeze(0)
+                lfn = self.fc_lfn(features).squeeze(0)
+
+                scs_list.append(scs)
+                rss_list.append(rss)
+                lss_list.append(lss)
+                rfn_list.append(rfn)
+                lfn_list.append(lfn)
+
+            scs_tensors.append(torch.stack(scs_list))
+            rss_tensors.append(torch.stack(rss_list))
+            lss_tensors.append(torch.stack(lss_list))
+            rfn_tensors.append(torch.stack(rfn_list))
+            lfn_tensors.append(torch.stack(lfn_list))
+
+        scs_tensors = torch.stack(scs_tensors)
+        rss_tensors = torch.stack(rss_tensors)
+        lss_tensors = torch.stack(lss_tensors)
+        rfn_tensors = torch.stack(rfn_tensors)
+        lfn_tensors = torch.stack(lfn_tensors)
+
+        scs_tensors = torch.softmax(scs_tensors, -1)
+        rss_tensors = torch.softmax(rss_tensors, -1)
+        lss_tensors = torch.softmax(lss_tensors, -1)
+        rfn_tensors = torch.softmax(rfn_tensors, -1)
+        lfn_tensors = torch.softmax(lfn_tensors, -1)
+
+        grade_sagittal_t1 = torch.cat([lfn_tensors, rfn_tensors], 1)
+        grade_axial = torch.cat([lss_tensors, rss_tensors], 1)
+        output = {}
         if "loss" in self.output_type:
-            new_batch = {
-                "image": crops,
-                "D": new_D,
-                "zxy_mask": output["zxy_mask"],
-                "grade": batch["grade"],
-            }
-        else:
-            new_batch = {"image": crops, "D": new_D, "zxy_mask": output["zxy_mask"]}
+            truth_sagittal_t1 = batch["grade_sagittal_t1"].to(device)
+            truth_sagittal_t2_stir = batch["grade_sagittal_t2_stir"].to(device)
+            truth_axial = batch["grade_axial_t2"].to(device)
 
-        return self.encoder_decoder(new_batch)
+            output["grade_loss_sagittal_t1"] = F_grade_loss(
+                grade_sagittal_t1, truth_sagittal_t1
+            )
+            output["grade_loss_sagittal_t2_stir"] = F_grade_loss(
+                scs_tensors, truth_sagittal_t2_stir[:, :5]
+            )
+            output["grade_loss_axial"] = F_grade_loss(grade_axial, truth_axial)
 
-    def extract_crop_3d(self, image, z, x, y):
+            output["grade_loss"] = (
+                output["grade_loss_sagittal_t1"]
+                + output["grade_loss_sagittal_t2_stir"]
+                + output["grade_loss_axial"]
+            ) / 3
+
+        if "infer" in self.output_type:
+            output["grade_sagittal_t1"] = F.softmax(grade_sagittal_t1, -1)
+            output["grade_sagittal_t2_stir"] = F.softmax(scs_tensors, -1)
+            output["grade_axial_t2"] = F.softmax(grade_axial, -1)
+
+        return output
+
+    def extract_crop_3d(
+        self, image, z, x, y, depth_size, crop_size, in_chans, full_depth=False
+    ):
         # image: tensor of shape (D, H, W)
         # z, x, y: scalars
         D, H, W = image.shape
@@ -682,10 +891,11 @@ class SecondStageModelV3(nn.Module):
         x = max(0, min(x, W - 1))
         y = max(0, min(y, H - 1))
         # Define the crop boundaries
-        half_size = self.crop_size // 2
-        half_depth_size = self.depth_size // 2
-        z_min = max(0, z - half_depth_size)
-        z_max = min(D, z + half_depth_size)
+        half_size = crop_size // 2
+        half_depth_size = depth_size // 2
+        z_min = max(0, z - half_depth_size) if not full_depth else 0
+
+        z_max = min(D, z + half_depth_size) if not full_depth else D
         y_min = max(0, y - half_size)
         y_max = min(H, y + half_size)
         x_min = max(0, x - half_size)
@@ -702,6 +912,7 @@ class SecondStageModelV3(nn.Module):
         pad_x_left = max(0, half_size - x)
         pad_x_right = max(0, (x + half_size) - W)
         # Note: pad order is (pad_W_left, pad_W_right, pad_H_left, pad_H_right, pad_D_left, pad_D_right)
+
         pad = (
             pad_x_left,
             pad_x_right,
@@ -713,16 +924,16 @@ class SecondStageModelV3(nn.Module):
         crop = F.pad(crop, pad, mode="constant", value=0)
         # Now crop shape should be (D_crop_padded, H_crop_padded, W_crop_padded)
         # Add channel dimension
-        if self.in_chans == 1:
+        if in_chans == 1:
             crop = crop.unsqueeze(0)
         else:
-            crop = crop.unsqueeze(0).repeat(self.in_chans, 1, 1, 1)
+            crop = crop.unsqueeze(0).repeat(in_chans, 1, 1, 1)
         # Resize crop to expected input size if necessary
         crop = F.interpolate(
             crop.unsqueeze(
                 0
             ),  # Shape: (1, in_chans, D_crop_padded, H_crop_padded, W_crop_padded)
-            size=(self.depth_size, self.crop_size, self.crop_size),
+            size=(depth_size, crop_size, crop_size),
             mode="trilinear",
             align_corners=False,
         ).squeeze(0)  # Shape: (in_chans, D_crop_padded, H_crop_padded, W_crop_padded)
@@ -765,7 +976,7 @@ def heatmap_to_grade(heatmap):
     grade = []
     for i in range(num_image):
         num_point, num_grade, D, H, W = heatmap[i].shape
-        g = torch.sum(heatmap[i], dim=(2, 3, 4))
+        g = torch.sum(heatmap[i], dim=(2, 3, 4))  # Shape: (num_point, num_grade)
         grade.append(g)
     grade = torch.stack(grade)
     return grade
@@ -851,7 +1062,9 @@ def F_grade_loss(grade, truth):
     g = grade.reshape(-1, 3)
 
     eps = 1e-5
-    loss = F.nll_loss(torch.clamp(g, eps, 1 - eps).log(), t, weight=weight)
+    loss = F.nll_loss(
+        torch.clamp(g, eps, 1 - eps).log(), t, weight=weight, ignore_index=-1
+    )
     # loss = F.cross_entropy(g, t, weight=weight, ignore_index=-1)
     return loss
 
@@ -937,6 +1150,7 @@ class LumbarSpineDataset(Dataset):
         train_on=["zxy", "grade"],
         series_type: str = "sagittal t1",
         direction: str = "left",
+        by_study: bool = False,
     ):
         """
         Args:
@@ -964,16 +1178,19 @@ class LumbarSpineDataset(Dataset):
             self.series_descriptions = series
 
         self.series_type = series_type
-        if isinstance(series_type, str):
-            self.series_type = [series_type]
-        if any(
-            st not in ["sagittal t1", "sagittal t2/stir", "axial t2"]
-            for st in self.series_type
-        ):
-            raise ValueError("Invalid series")
+        if series_type is not None:
+            if isinstance(series_type, str):
+                self.series_type = [series_type]
+            if any(
+                st not in ["sagittal t1", "sagittal t2/stir", "axial t2"]
+                for st in self.series_type
+            ):
+                raise ValueError("Invalid series")
 
-        if direction not in ["left", "right"]:
-            raise ValueError("Invalid direction")
+        if direction is not None:
+            if direction not in ["left", "right"]:
+                raise ValueError("Invalid direction")
+        self.by_study = by_study
         self.direction = direction
         self.transform = transform
         self.train_on = train_on
@@ -982,7 +1199,40 @@ class LumbarSpineDataset(Dataset):
         self.output_dim = output_dim
         self.valid_indices = set(range(len(self.samples)))
 
+    def _prepare_samples_by_study(self):
+        samples = defaultdict(list)
+        self.study_ids = set()
+        for _, row in self.series_descriptions.iterrows():
+            study_id = row["study_id"]
+            series_id = row["series_id"]
+            series_description = row["series_description"].lower()
+            if (
+                self.series_type is not None
+                and series_description not in self.series_type
+            ):
+                continue
+
+            # Build the image directory
+            image_dir = os.path.join(self.image_dir, str(study_id), str(series_id))
+
+            # Collect all DICOM file paths
+            dicom_files = glob.glob(f"{image_dir}/*.dcm")
+            if not dicom_files:
+                continue
+
+            samples[study_id].append({
+                "study_id": study_id,
+                "series_id": series_id,
+                "series_description": series_description,
+                "image_dir": image_dir,
+            })
+            self.study_ids.add(study_id)
+        self.study_ids = list(self.study_ids)
+        return samples
+
     def _prepare_samples(self):
+        if self.by_study:
+            return self._prepare_samples_by_study()
         samples = []
 
         # For each study, collect series information
@@ -990,7 +1240,10 @@ class LumbarSpineDataset(Dataset):
             study_id = row["study_id"]
             series_id = row["series_id"]
             series_description = row["series_description"].lower()
-            if series_description not in self.series_type:
+            if (
+                self.series_type is not None
+                and series_description not in self.series_type
+            ):
                 continue
 
             # Build the image directory
@@ -1059,8 +1312,17 @@ class LumbarSpineDataset(Dataset):
 
         return instance_numbers_needed
 
-    def _get_all(self, idx, count=0) -> Union[dict, torch.Tensor]:
-        sample_info = self.samples[idx]
+    def _get_all(
+        self, sample_info, idx=None, count=0, max_count=10
+    ) -> Union[dict, torch.Tensor]:
+        def _handle_error(idx, count, max_count):
+            if count > max_count:
+                raise ValueError("No a valid dataset.")
+            if idx in self.valid_indices:
+                self.valid_indices.remove(idx)
+            new_index = self._get_new_index(idx)
+            return self._get_all(self.samples[new_index], new_index, count + 1)
+
         try:
             instance_numbers_needed = self._get_instance_numbers_needed(sample_info)
 
@@ -1074,11 +1336,7 @@ class LumbarSpineDataset(Dataset):
 
             # Handle any errors in reading the series
             if error_code:
-                if idx in self.valid_indices:
-                    self.valid_indices.remove(idx)
-                if count > 10:
-                    raise ValueError(f"The dataset is corrupted: {error_code}")
-                return self._get_all(self._get_new_index(idx), count + 1)
+                return _handle_error(idx, count, max_count)
 
             # Prepare the image tensor
             # The volume is in shape (D, H, W), we need to convert it to (C, H, W)
@@ -1106,11 +1364,7 @@ class LumbarSpineDataset(Dataset):
             )
 
             if torch.all(z == -1):
-                if idx in self.valid_indices:
-                    self.valid_indices.remove(idx)
-                if count > 10:
-                    raise ValueError("No valid coordinates found.")
-                return self._get_all(self._get_new_index(idx), count + 1)
+                return _handle_error(idx, count, max_count)
 
             grade = None
             heatmap = None
@@ -1118,11 +1372,7 @@ class LumbarSpineDataset(Dataset):
                 grade = self._prepare_grade(sample_info)
 
                 if torch.all(grade == -1):
-                    if idx in self.valid_indices:
-                        self.valid_indices.remove(idx)
-                    if count > 10:
-                        raise ValueError("No valid grade found.")
-                    return self._get_all(self._get_new_index(idx), count + 1)
+                    return _handle_error(idx, count, max_count)
 
                 if "zxy" in self.train_on:
                     heatmap = self.generate_heatmap(
@@ -1158,17 +1408,8 @@ class LumbarSpineDataset(Dataset):
             out["study_id"] = sample_info["study_id"]
             out["series_description"] = sample_info["series_description"]
 
-            if "sagittal t2/stir" in sample_info["series_description"].lower():
-                if "heatmap" in out:
-                    out["heatmap"] = out["heatmap"][:, :5, ...]
-                if "grade" in out:
-                    out["grade"] = out["grade"][:5]
-                if "xy" in out:
-                    out["xy"] = out["xy"][:5, :]
-                if "z" in out:
-                    out["z"] = out["z"][:5]
-            elif "sagittal t1" in sample_info["series_description"].lower():
-                if self.direction == "left":
+            if self.series_type is not None:
+                if "sagittal t2/stir" in sample_info["series_description"].lower():
                     if "heatmap" in out:
                         out["heatmap"] = out["heatmap"][:, :5, ...]
                     if "grade" in out:
@@ -1177,27 +1418,69 @@ class LumbarSpineDataset(Dataset):
                         out["xy"] = out["xy"][:5, :]
                     if "z" in out:
                         out["z"] = out["z"][:5]
-                elif self.direction == "right":
-                    if "heatmap" in out:
-                        out["heatmap"] = out["heatmap"][:, 5:, ...]
-                    if "grade" in out:
-                        out["grade"] = out["grade"][5:]
-                    if "xy" in out:
-                        out["xy"] = out["xy"][5:, :]
-                    if "z" in out:
-                        out["z"] = out["z"][5:]
+                elif "sagittal t1" in sample_info["series_description"].lower():
+                    if self.direction == "left":
+                        if "heatmap" in out:
+                            out["heatmap"] = out["heatmap"][:, :5, ...]
+                        if "grade" in out:
+                            out["grade"] = out["grade"][:5]
+                        if "xy" in out:
+                            out["xy"] = out["xy"][:5, :]
+                        if "z" in out:
+                            out["z"] = out["z"][:5]
+                    elif self.direction == "right":
+                        if "heatmap" in out:
+                            out["heatmap"] = out["heatmap"][:, 5:, ...]
+                        if "grade" in out:
+                            out["grade"] = out["grade"][5:]
+                        if "xy" in out:
+                            out["xy"] = out["xy"][5:, :]
+                        if "z" in out:
+                            out["z"] = out["z"][5:]
 
             return out
 
         except Exception as e:
+            return _handle_error(idx, count, max_count)
+
+    def _get_all_by_study(
+        self, idx, count=0, max_count=10
+    ) -> Union[dict, torch.Tensor]:
+        study_id = self.study_ids[idx]
+        sample_info_list = self.samples[study_id]
+        out = defaultdict(list)
+        for sample_info in sample_info_list:
+            try:
+                series_description = sample_info["series_description"]
+                out[series_description].append(self._get_all(sample_info, max_count=-1))
+            except Exception as e:
+                if count > max_count:
+                    raise e
+                if idx in self.valid_indices:
+                    self.valid_indices.remove(idx)
+                new_index = self._get_new_index(idx)
+                return self._get_all_by_study(new_index, count + 1, max_count)
+        if len(out) != 3:
             if idx in self.valid_indices:
                 self.valid_indices.remove(idx)
-            if count > 10:
-                raise e
-            return self._get_all(self._get_new_index(idx), count + 1)
+            new_index = self._get_new_index(idx)
+            return self._get_all_by_study(new_index, count + 1, max_count)
+        # Create a dict with key + series_description
+        new_out = {}
+        for o in out:
+            # random pick one series_description
+            i = np.random.randint(len(out[o]))
+            series_description = o.lower().replace(" ", "_").replace("/", "_")
+            for k, v in out[o][i].items():
+                new_key = f"{k}_{series_description}"
+                new_out[new_key] = v
+
+        return new_out
 
     def __getitem__(self, idx) -> Union[dict, torch.Tensor]:
-        return self._get_all(idx)
+        if self.by_study:
+            return self._get_all_by_study(idx)
+        return self._get_all(self.samples[idx], idx)
 
     def crop_volume(instance_numbers, instance_numbers_needed, depth, max_depth):
         required_indices = [
@@ -1813,11 +2096,8 @@ def custom_collate_fn(batch):
     if isinstance(batch[0], torch.Tensor):
         return torch.stack(batch)
     for key in batch[0].keys():
-        if key == "image":
-            # concat intead of stack
-            new_batch["image"] = torch.cat([sample["image"] for sample in batch])
-        elif key == "heatmap":
-            new_batch["heatmap"] = torch.cat([sample["heatmap"] for sample in batch])
+        if "heatmap" in key or "image" in key:
+            new_batch[key] = torch.cat([sample[key] for sample in batch])
         elif isinstance(batch[0][key], torch.Tensor):
             new_batch[key] = torch.stack([sample[key] for sample in batch])
         else:
