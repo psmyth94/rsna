@@ -23,10 +23,10 @@ def train(
 ):
     torch_device = torch.device(device)
     # %%
-    log_frequency = 10 if not debug else 1
+    log_frequency = 2 if not debug else 1
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=1e-3,
+        lr=1e-4,
         weight_decay=1e-2,
     )
 

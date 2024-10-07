@@ -205,6 +205,9 @@ class FirstStageModel(nn.Module):
         self.num_grades = num_grades
         if "zxy" in self.train_on and "grade" in self.train_on:
             self.heatmap = nn.Sequential(
+                nn.Conv3d(decoder_dim[-1], decoder_dim[-1], kernel_size=1),
+                nn.BatchNorm3d(decoder_dim[-1]),
+                nn.ReLU(inplace=True),
                 nn.Dropout3d(0.5),
                 nn.Conv3d(decoder_dim[-1], num_points * num_grades, kernel_size=1),
             )
