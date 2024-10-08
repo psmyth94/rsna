@@ -208,7 +208,7 @@ class FirstStageModel(nn.Module):
                 nn.Conv3d(decoder_dim[-1], decoder_dim[-1], kernel_size=1),
                 nn.BatchNorm3d(decoder_dim[-1]),
                 nn.ReLU(inplace=True),
-                nn.Dropout3d(0.5),
+                nn.Dropout3d(0.3),
                 nn.Conv3d(decoder_dim[-1], num_points * num_grades, kernel_size=1),
             )
         elif "zxy" in self.train_on:
@@ -1446,6 +1446,12 @@ class LumbarSpineDataset(Dataset):
                             out["xy"] = out["xy"][5:, :]
                         if "z" in out:
                             out["z"] = out["z"][5:]
+
+            if "grade" in out and torch.all(out["grade"] == -1):
+                return _handle_error(idx, count, max_count)
+
+            if "z" in out and torch.all(out["z"] == -1):
+                return _handle_error(idx, count, max_count)
 
             return out
 

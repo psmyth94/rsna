@@ -17,7 +17,7 @@ def train(
     checkpoint_dir=None,
     batch_size=1,
     accumulation_steps=4,
-    num_epochs=31,
+    num_epochs=11,
     scheduler=None,
     debug=False,
 ):
