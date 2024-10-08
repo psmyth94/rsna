@@ -326,6 +326,8 @@ class FirstStageModel(nn.Module):
                     )
 
         if "infer" in self.output_type:
+            if "zxy" in self.train_on and "grade" in self.train_on:
+                output["heatmap"] = F.softmax(heatmap, -1)
             if "zxy" in self.train_on:
                 output["zxy_mask"] = zxy_mask
                 output["xy"] = xy
@@ -1223,14 +1225,12 @@ class LumbarSpineDataset(Dataset):
             if not dicom_files:
                 continue
 
-            samples[study_id].append(
-                {
-                    "study_id": study_id,
-                    "series_id": series_id,
-                    "series_description": series_description,
-                    "image_dir": image_dir,
-                }
-            )
+            samples[study_id].append({
+                "study_id": study_id,
+                "series_id": series_id,
+                "series_description": series_description,
+                "image_dir": image_dir,
+            })
             self.study_ids.add(study_id)
         self.study_ids = list(self.study_ids)
         return samples
@@ -1260,14 +1260,12 @@ class LumbarSpineDataset(Dataset):
                 continue  # Skip if no DICOM files found
 
             # Prepare sample entry
-            samples.append(
-                {
-                    "study_id": study_id,
-                    "series_id": series_id,
-                    "series_description": series_description,
-                    "image_dir": image_dir,
-                }
-            )
+            samples.append({
+                "study_id": study_id,
+                "series_id": series_id,
+                "series_description": series_description,
+                "image_dir": image_dir,
+            })
         return samples
 
     def __len__(self):
@@ -1403,13 +1401,11 @@ class LumbarSpineDataset(Dataset):
             }
 
             if "zxy" in self.train_on:
-                out.update(
-                    {
-                        "z": z.half(),
-                        "xy": xy.half(),
-                        "heatmap": heatmap,
-                    }
-                )
+                out.update({
+                    "z": z.half(),
+                    "xy": xy.half(),
+                    "heatmap": heatmap,
+                })
 
             if "grade" in self.train_on and grade is not None:
                 out["grade"] = grade.long()
@@ -1560,28 +1556,24 @@ class LumbarSpineDataset(Dataset):
         # Make DICOM header DataFrame
         dicom_df = []
         for i, d in zip(instance_numbers, dicoms):
-            dicom_df.append(
-                {
-                    "study_id": study_id,
-                    "series_id": series_id,
-                    "series_description": series_description,
-                    "instance_number": i,
-                    "ImagePositionPatient": [float(v) for v in d.ImagePositionPatient],
-                    "ImageOrientationPatient": [
-                        float(v) for v in d.ImageOrientationPatient
-                    ],
-                    "PixelSpacing": [float(v) for v in d.PixelSpacing],
-                    "SpacingBetweenSlices": float(
-                        getattr(d, "SpacingBetweenSlices", 1.0)
-                    ),
-                    "SliceThickness": float(getattr(d, "SliceThickness", 1.0)),
-                    "grouping": str(
-                        [round(float(v), 3) for v in d.ImageOrientationPatient]
-                    ),
-                    "H": d.pixel_array.shape[0],
-                    "W": d.pixel_array.shape[1],
-                }
-            )
+            dicom_df.append({
+                "study_id": study_id,
+                "series_id": series_id,
+                "series_description": series_description,
+                "instance_number": i,
+                "ImagePositionPatient": [float(v) for v in d.ImagePositionPatient],
+                "ImageOrientationPatient": [
+                    float(v) for v in d.ImageOrientationPatient
+                ],
+                "PixelSpacing": [float(v) for v in d.PixelSpacing],
+                "SpacingBetweenSlices": float(getattr(d, "SpacingBetweenSlices", 1.0)),
+                "SliceThickness": float(getattr(d, "SliceThickness", 1.0)),
+                "grouping": str([
+                    round(float(v), 3) for v in d.ImageOrientationPatient
+                ]),
+                "H": d.pixel_array.shape[0],
+                "W": d.pixel_array.shape[1],
+            })
         dicom_df = pd.DataFrame(dicom_df)
 
         # Handle multi-shape images
@@ -1619,12 +1611,10 @@ class LumbarSpineDataset(Dataset):
             volume = np.stack(volume)
             volume = self.normalise_to_8bit(volume)
 
-            data.append(
-                {
-                    "df": df_group,
-                    "volume": volume,
-                }
-            )
+            data.append({
+                "df": df_group,
+                "volume": volume,
+            })
 
             # Sort data by group
             if "sagittal" in series_description.lower():
@@ -2161,7 +2151,7 @@ def save_combined_heatmap_as_png(
         grades (Tensor): Grades tensor of shape [D, num_point, num_grades].
         xy_coords (Tensor): Coordinates tensor of shape [num_point, 2].
         z_coords (Tensor): Tensor containing selected depth indices to visualize.
-        image (Tensor): Background image tensor of shape [C, H, W].
+        image (Tensor): Background image tensor of shape [D, H, W].
         point (optional): List of points to visualize. Defaults to all points.
 
     Raises:
@@ -2201,30 +2191,21 @@ def save_combined_heatmap_as_png(
             )
         if image.ndim != 3:
             raise ValueError(
-                f"background_image must have 3 dimensions [C, H, W], got {image.ndim} dimensions"
+                f"background_image must have 3 dimensions [D, H, W], got {image.ndim} dimensions"
             )
-        C_bg, H_bg, W_bg = image.shape
-        if C_bg not in [1, 3, 4]:
+        D_bg, H_bg, W_bg = image.shape
+        if D_bg != D:
             raise ValueError(
-                f"background_image must have 1, 3, or 4 channels, got {C_bg}"
+                f"background_image must have the same depth as heatmap, got {D_bg} instead of {D}"
             )
         # Resize background image to match heatmap size if necessary
         if H_bg != H or W_bg != W:
             # Use torch to resize (assuming background_image is float tensor)
             image = torch.nn.functional.interpolate(
-                image.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False
-            ).squeeze(0)
-        # Convert to NumPy array and transpose to [H, W, C]
-        background_image_np = image.permute(1, 2, 0).numpy()
-        # If grayscale, convert to RGB by repeating channels
-        if C_bg == 1:
-            background_image_np = np.repeat(background_image_np, 3, axis=2)
-        elif C_bg == 4:
-            # If RGBA, discard the alpha channel
-            background_image_np = background_image_np[:, :, :3]
-        # Normalize if necessary (assuming background_image is in [0, 1] or [0, 255]
-        if background_image_np.max() > 1.0:
-            background_image_np = background_image_np / 255.0
+                image.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False
+            ).squeeze(1)
+        # Convert to NumPy array
+        background_image_np = image.numpy()
     else:
         background_image_np = None  # Use black background
 
@@ -2246,9 +2227,7 @@ def save_combined_heatmap_as_png(
         cumulative_heatmap = torch.zeros((H, W), dtype=torch.float32)
         for p in point:
             for g in range(num_grades):
-                cumulative_heatmap += (
-                    heatmap[d.int().item(), p, g, :, :] * grades[d.int().item(), p, g]
-                )
+                cumulative_heatmap += heatmap[d.int().item(), p, g, :, :] * grades[p, g]
 
         # Normalize the cumulative heatmap to [0, 1]
         heatmap_min = cumulative_heatmap.min()
@@ -2266,8 +2245,18 @@ def save_combined_heatmap_as_png(
         plt.figure(figsize=(6, 6))
 
         if background_image_np is not None:
-            # Display background image
-            plt.imshow(background_image_np, extent=(0, W, H, 0))
+            # Display background image for the current depth
+            plt.imshow(
+                background_image_np[d.int().item(), :, :],
+                cmap="gray",
+                extent=(0, W, H, 0),
+            )
+            # save the original image
+            plt.imsave(
+                f"original_image_depth_{d}.png",
+                background_image_np[d.int().item(), :, :],
+                cmap="gray",
+            )
         else:
             # Use black background
             plt.imshow(np.zeros((H, W, 3)), extent=(0, W, H, 0))
@@ -2296,9 +2285,9 @@ def save_combined_heatmap_as_png(
             plt.scatter(x, y, s=100, facecolors="none", edgecolors="cyan", linewidth=2)
 
             # Add a label (e.g., point index)
-            plt.text(x, y, str(p), color="cyan", fontsize=12, ha="center", va="center")
-
-        # Save the plot as a PNG image
+            plt.text(
+                x, y, str(p), color="cyan", fontsize=12, ha="center", va="center"
+            )  # Save the plot as a PNG image
         plt.savefig(f"heatmap_depth_{d}.png", bbox_inches="tight")
         plt.close()
 

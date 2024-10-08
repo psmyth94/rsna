@@ -30,10 +30,10 @@ logger_setup()
 
 # %%
 
-base_path = "data"
-base_model_path = "models"
+base_path = "data/rsna-2024-lumbar-spine-degenerative-classification"
+base_model_path = "models2"
 
-args = dotdict(all=False, max_depth=50, train_on=["zxy", "grade"], stage=2)
+args = dotdict(all=False, max_depth=50, train_on=["zxy", "grade"], stage=1)
 
 today_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 checkpoint_dir = f"checkpoints_{today_str}"
@@ -124,7 +124,7 @@ else:
 logger.info("Creating model and optimizer...")
 model = FirstStageModel(train_on=args.train_on)
 state_dict = torch.load(
-    f"{base_model_path}/first_stage_best_model.pth",
+    f"{base_model_path}/best_model.pth",
     map_location=lambda storage, loc: storage,
     weights_only=True,
 )
@@ -155,12 +155,14 @@ for batch_idx, batch in enumerate(train_loader):
         continue
 
     output = get_output(model, batch_input, debug=True)
+    print(output["heatmap"].shape)
+    print(batch_input["grade"].shape)
     save_combined_heatmap_as_png(
-        output["heatmap"].cpu().numpy(),
-        batch_input["grade"].cpu().numpy(),
-        batch_input["xy"].cpu().numpy(),
-        batch_input["z"].cpu().numpy(),
-        batch_input["image"].cpu().numpy(),
+        output["heatmap"],
+        output["grade"][0],
+        batch_input["xy"][0],
+        batch_input["z"][0],
+        batch_input["image"],
     )
     if any([x in batch["series_description"][0].lower() for x in needed_examples]):
         # remove from needed examples
@@ -172,3 +174,4 @@ for batch_idx, batch in enumerate(train_loader):
         logger.info(f"Remaining needed examples: {needed_examples}")
     if len(needed_examples) == 0:
         break
+    # %%
